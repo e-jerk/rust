@@ -1,0 +1,221 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Block configuration buffer (4 uints per block)
+layout(set = 0, binding = 0) readonly buffer BlockConfigs {
+    uint data[];
+} configs;
+
+// Packed effects buffer: 1 uint32 per statement
+// Encoding:
+//   Bits 0-7:   DSE effect (0=NOOP, 1=GEN, 2=KILL)
+//   Bits 8-15:  DSE local index
+//   Bits 8-23:  Copy propagation fact (dst<<8 | src, or 0xFFFF=NOOP)
+//   Bits 16-31: Constant propagation fact (local<<8 | value, or 0xFFFF=NOOP)
+//   Bits 24-31: Reaching definitions def_id (or 0xFF=NOOP)
+layout(set = 0, binding = 1) readonly buffer EffectsFused {
+    uint data[];
+} effects_fused;
+
+// Entry states: interleaved per block
+//   [dse(bitset_words) | copy(num_locals) | const(num_locals) | reach(bitset_words)]
+layout(set = 0, binding = 2) buffer EntryStatesFused {
+    uint data[];
+} entry_states_fused;
+
+// Exit states: same interleaving as entry
+layout(set = 0, binding = 3) buffer ExitStatesFused {
+    uint data[];
+} exit_states_fused;
+
+// Convergence flags: one uint per analysis
+layout(set = 0, binding = 4) buffer Convergence {
+    uint flags[4];
+} convergence;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint num_locals;
+    uint bitset_words;
+    uint effects_stride;
+} pc;
+
+#define EFFECT_DSE_NOP  0
+#define EFFECT_DSE_GEN  1
+#define EFFECT_DSE_KILL 2
+
+#define DSE_EFFECT(e)  ((e) & 0xFF)
+#define DSE_LOCAL(e)   (((e) >> 8) & 0xFF)
+#define COPY_FACT(e)   (((e) >> 8) & 0xFFFF)
+#define CONST_FACT(e)  (((e) >> 16) & 0xFFFF)
+#define REACH_DEF(e)   (((e) >> 24) & 0xFF)
+
+#define COPY_NOOP  0xFFFF
+#define CONST_NOOP 0xFFFF
+#define REACH_NOOP 0xFF
+
+// Dead Store Elimination: backward iteration, bitset operations
+void transfer_dse(uint block_idx, uint stmt_count, uint max_bitset_words, inout uint dse_state[32]) {
+    for (int stmt_idx = int(stmt_count) - 1; stmt_idx >= 0; stmt_idx--) {
+        uint effect = effects_fused.data[block_idx * pc.effects_stride + uint(stmt_idx)];
+        uint kind = DSE_EFFECT(effect);
+
+        if (kind == EFFECT_DSE_NOP) continue;
+
+        uint local = DSE_LOCAL(effect);
+        if (local >= max_bitset_words * 32) continue;
+
+        uint word = local / 32;
+        uint bit = local % 32;
+        uint mask = 1u << bit;
+
+        if (kind == EFFECT_DSE_GEN) {
+            dse_state[word] |= mask;
+        } else if (kind == EFFECT_DSE_KILL) {
+            dse_state[word] &= ~mask;
+        }
+    }
+}
+
+// Copy Propagation: forward iteration, per-local array
+void transfer_copy_prop(uint block_idx, uint stmt_count, uint max_locals, inout uint copy_state[128]) {
+    for (uint stmt_idx = 0; stmt_idx < stmt_count; stmt_idx++) {
+        uint effect = effects_fused.data[block_idx * pc.effects_stride + stmt_idx];
+        uint fact = COPY_FACT(effect);
+
+        if (fact == COPY_NOOP) continue;
+
+        uint dst = (fact >> 8) & 0xFF;
+        uint src = fact & 0xFF;
+
+        if (dst < max_locals) {
+            copy_state[dst] = src + 1; // +1 to distinguish from "no copy" (0)
+        }
+    }
+}
+
+// Constant Propagation: forward iteration, per-local array
+void transfer_const_prop(uint block_idx, uint stmt_count, uint max_locals, inout uint const_state[128]) {
+    for (uint stmt_idx = 0; stmt_idx < stmt_count; stmt_idx++) {
+        uint effect = effects_fused.data[block_idx * pc.effects_stride + stmt_idx];
+        uint fact = CONST_FACT(effect);
+
+        if (fact == CONST_NOOP) continue;
+
+        uint local = (fact >> 8) & 0xFF;
+        uint value = fact & 0xFF;
+
+        if (local < max_locals) {
+            const_state[local] = value + 1; // +1 to distinguish from "not constant" (0)
+        }
+    }
+}
+
+// Reaching Definitions: forward iteration, bitset operations
+void transfer_reaching_defs(uint block_idx, uint stmt_count, uint max_bitset_words, inout uint reach_state[32]) {
+    for (uint stmt_idx = 0; stmt_idx < stmt_count; stmt_idx++) {
+        uint effect = effects_fused.data[block_idx * pc.effects_stride + stmt_idx];
+        uint def_id = REACH_DEF(effect);
+
+        if (def_id == REACH_NOOP) continue;
+
+        uint word = def_id / 32;
+        uint bit = def_id % 32;
+
+        if (word < max_bitset_words) {
+            reach_state[word] |= (1u << bit);
+        }
+    }
+}
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+
+    uint config_base = block_idx * 4;
+    uint stmt_count = configs.data[config_base];
+
+    // State layout per block (fixed max sizes):
+    //   [dse(32 words) | copy(128) | const(128) | reach(32)]
+    uint block_base = block_idx * 320u;
+    uint dse_start = block_base;
+    uint copy_start = block_base + 32u;
+    uint const_start = copy_start + 128u;
+    uint reach_start = const_start + 128u;
+
+    uint max_bitset_words = min(pc.bitset_words, 32u);
+    uint max_locals = min(pc.num_locals, 128u);
+
+    // Load all 4 entry states
+    uint dse_state[32];
+    for (uint w = 0; w < max_bitset_words; w++) {
+        dse_state[w] = entry_states_fused.data[dse_start + w];
+    }
+
+    uint copy_state[128];
+    for (uint i = 0; i < max_locals; i++) {
+        copy_state[i] = entry_states_fused.data[copy_start + i];
+    }
+
+    uint const_state[128];
+    for (uint i = 0; i < max_locals; i++) {
+        const_state[i] = entry_states_fused.data[const_start + i];
+    }
+
+    uint reach_state[32];
+    for (uint w = 0; w < max_bitset_words; w++) {
+        reach_state[w] = entry_states_fused.data[reach_start + w];
+    }
+
+    // Call all 4 transfer functions
+    transfer_dse(block_idx, stmt_count, max_bitset_words, dse_state);
+    transfer_copy_prop(block_idx, stmt_count, max_locals, copy_state);
+    transfer_const_prop(block_idx, stmt_count, max_locals, const_state);
+    transfer_reaching_defs(block_idx, stmt_count, max_bitset_words, reach_state);
+
+    // Write all 4 exit states and track changes
+    bool changed_dse = false;
+    for (uint w = 0; w < max_bitset_words; w++) {
+        uint old = exit_states_fused.data[dse_start + w];
+        if (old != dse_state[w]) {
+            exit_states_fused.data[dse_start + w] = dse_state[w];
+            changed_dse = true;
+        }
+    }
+
+    bool changed_copy = false;
+    for (uint i = 0; i < max_locals; i++) {
+        uint old = exit_states_fused.data[copy_start + i];
+        if (old != copy_state[i]) {
+            exit_states_fused.data[copy_start + i] = copy_state[i];
+            changed_copy = true;
+        }
+    }
+
+    bool changed_const = false;
+    for (uint i = 0; i < max_locals; i++) {
+        uint old = exit_states_fused.data[const_start + i];
+        if (old != const_state[i]) {
+            exit_states_fused.data[const_start + i] = const_state[i];
+            changed_const = true;
+        }
+    }
+
+    bool changed_reach = false;
+    for (uint w = 0; w < max_bitset_words; w++) {
+        uint old = exit_states_fused.data[reach_start + w];
+        if (old != reach_state[w]) {
+            exit_states_fused.data[reach_start + w] = reach_state[w];
+            changed_reach = true;
+        }
+    }
+
+    // If any state changed, set all 4 convergence flags
+    if (changed_dse || changed_copy || changed_const || changed_reach) {
+        atomicOr(convergence.flags[0], 1u);
+        atomicOr(convergence.flags[1], 1u);
+        atomicOr(convergence.flags[2], 1u);
+        atomicOr(convergence.flags[3], 1u);
+    }
+}
