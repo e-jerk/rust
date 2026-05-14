@@ -142,3 +142,60 @@ impl<'tcx, 'a> GpuMirSerializer<'tcx, 'a> {
         }
     }
 }
+
+pub fn serialize_batch<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    items: &[MonoItem<'tcx>],
+) -> SerializedBatch<'tcx> {
+    let mut actions = Vec::new();
+    let mut body_offsets = Vec::new();
+    let mut args_table = Vec::new();
+    let mut args_index = FxHashMap::default();
+    let mut instances = Vec::new();
+
+    body_offsets.push(0);
+
+    for item in items {
+        let instance = match item {
+            MonoItem::Fn(instance) => *instance,
+            _ => continue, // Statics and global asm handled separately
+        };
+
+        let body = tcx.instance_mir(instance.def);
+        let _start = actions.len() as u32;
+
+        let mut serializer = GpuMirSerializer {
+            tcx,
+            actions: &mut actions,
+            args_table: &mut args_table,
+            args_index: &mut args_index,
+            instance,
+            body,
+        };
+        serializer.visit_body(body);
+
+        body_offsets.push(actions.len() as u32);
+        instances.push(instance);
+    }
+
+    SerializedBatch {
+        actions,
+        body_offsets,
+        generic_args_table: args_table,
+        instances,
+    }
+}
+
+pub fn resolve_edge<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    edge: GpuEdge,
+    batch: &SerializedBatch<'tcx>,
+) -> Option<Instance<'tcx>> {
+    let def_id = DefId {
+        krate: rustc_hir::def_id::CrateNum::from_u32(edge.def_id_krate),
+        index: rustc_hir::def_id::DefIndex::from_u32(edge.def_id_index),
+    };
+    let args = batch.generic_args_table.get(edge.args_idx as usize)?;
+
+    Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), def_id, *args).ok().flatten()
+}
