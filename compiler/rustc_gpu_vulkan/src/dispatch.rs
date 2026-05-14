@@ -134,25 +134,26 @@ impl<'ctx> GpuDispatch<'ctx> {
             let workgroup_count = (num_bodies + 63) / 64;
             device.cmd_dispatch(cmd_buf, workgroup_count, 1, 1);
             
-            // Memory barrier for edges_buf
-            let barriers = [
+            // Memory barrier for edges_buf and optionally counter_buf
+            let mut barriers = vec![
                 vk::BufferMemoryBarrier::default()
                     .buffer(edges_buf.buffer)
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::HOST_READ)
                     .size(vk::WHOLE_SIZE),
-                vk::BufferMemoryBarrier::default()
-                    .buffer(buffer_infos[3].buffer)
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::HOST_READ)
-                    .size(vk::WHOLE_SIZE),
             ];
             
-            let barrier_slice = if counter_buf.is_some() {
-                &barriers[..]
-            } else {
-                &barriers[..1]
-            };
+            if let Some(counter) = counter_buf {
+                barriers.push(
+                    vk::BufferMemoryBarrier::default()
+                        .buffer(counter.buffer)
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)
+                        .size(vk::WHOLE_SIZE),
+                );
+            }
+            
+            let barrier_slice = &barriers[..];
             
             device.cmd_pipeline_barrier(
                 cmd_buf,
