@@ -5,6 +5,9 @@ pub mod context;
 pub mod dispatch;
 pub mod shader;
 
+use gpu_alloc as _;
+use gpu_alloc_ash as _;
+use tracing as _;
 use std::sync::Arc;
 
 /// Feature-gated GPU backend. Returns None if Vulkan unavailable.
