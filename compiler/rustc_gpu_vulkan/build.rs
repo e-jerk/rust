@@ -66,4 +66,9 @@ fn main() {
         &out_dir,
         "REACHING_DEFS_SPV",
     );
+    compile_shader(
+        "src/shaders/ssa_construct.comp",
+        &out_dir,
+        "SSA_CONSTRUCT_SPV",
+    );
 }

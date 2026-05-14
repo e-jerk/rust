@@ -1053,4 +1053,132 @@ impl<'tcx> GpuEngine<'tcx> {
             }
         }
     }
+
+    // ------------------------------------------------------------------
+    // GPU-accelerated SSA Construction
+    // ------------------------------------------------------------------
+
+    /// Run SSA construction on GPU to identify phi node insertion points.
+    ///
+    /// Returns a vector of (block, local) pairs indicating where phi nodes are needed.
+    pub fn run_ssa_construction(&self) -> Option<Vec<(BasicBlock, Local)>> {
+        if self.body.basic_blocks.len() < 50 {
+            return None;
+        }
+
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_ssa_construct_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let num_locals = self.body.local_decls.len();
+        let max_defs_per_block = 16; // Cap definitions per block
+        let phi_words = (num_locals + 31) / 32;
+        let df_words = (num_blocks + 31) / 32;
+
+        // Serialize block info
+        let (block_info, def_sites) = self.serialize_ssa_blocks(max_defs_per_block);
+
+        // Initialize outputs
+        let dom_frontier: Vec<u32> = vec![0; num_blocks * df_words];
+        let phi_nodes: Vec<u32> = vec![0; num_blocks * phi_words];
+
+        let block_info_buf = backend
+            .create_buffer((block_info.len() * std::mem::size_of::<u32>()) as u64)?;
+        block_info_buf.write(&block_info);
+
+        let def_sites_buf = backend
+            .create_buffer((def_sites.len() * std::mem::size_of::<u32>()) as u64)?;
+        def_sites_buf.write(&def_sites);
+
+        let dom_frontier_buf = backend
+            .create_buffer((dom_frontier.len() * std::mem::size_of::<u32>()) as u64)?;
+        dom_frontier_buf.write(&dom_frontier);
+
+        let phi_nodes_buf = backend
+            .create_buffer((phi_nodes.len() * std::mem::size_of::<u32>()) as u64)?;
+        phi_nodes_buf.write(&phi_nodes);
+
+        // Single GPU dispatch (SSA construction is not iterative)
+        gpu.dispatch_ssa_round(
+            &block_info_buf,
+            &def_sites_buf,
+            &dom_frontier_buf,
+            &phi_nodes_buf,
+            num_blocks as u32,
+            num_locals as u32,
+            max_defs_per_block,
+        )
+        .ok()?;
+
+        // Read back phi node bitmap
+        let phi_data: Vec<u32> = phi_nodes_buf.read(num_blocks * phi_words);
+
+        // Convert bitmap to (block, local) pairs
+        let mut phi_insertions = Vec::new();
+        for block_idx in 0..num_blocks {
+            let start = block_idx * phi_words;
+            for word_idx in 0..phi_words {
+                let word = phi_data[start + word_idx];
+                if word == 0 {
+                    continue;
+                }
+                let base_local = word_idx * 32;
+                for bit in 0..32 {
+                    if word & (1u32 << bit) != 0 {
+                        let local_idx = base_local + bit;
+                        if local_idx < num_locals {
+                            phi_insertions.push((
+                                BasicBlock::from_usize(block_idx),
+                                Local::from_usize(local_idx),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(phi_insertions)
+    }
+
+    /// Serialize blocks for SSA construction.
+    fn serialize_ssa_blocks(&self, max_defs_per_block: u32) -> (Vec<u32>, Vec<u32>) {
+        let num_blocks = self.body.basic_blocks.len();
+
+        let mut block_info = Vec::with_capacity(num_blocks * (2 + max_defs_per_block as usize));
+        let mut def_sites = vec![0xFFFFFFFFu32; num_blocks * max_defs_per_block as usize];
+
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            let preds = &self.body.basic_blocks.predecessors()[block_idx];
+            let num_preds = preds.len().min(2); // Cap at 2 predecessors for GPU
+
+            block_info.push(num_preds as u32);
+
+            let mut num_defs: u32 = 0;
+            for stmt in &block.statements {
+                if let StatementKind::Assign((place, _)) = &stmt.kind {
+                    if let Some(local) = place.as_local() {
+                        if num_defs < max_defs_per_block {
+                            def_sites[block_idx.index() * max_defs_per_block as usize + num_defs as usize] =
+                                local.as_u32();
+                            num_defs += 1;
+                        }
+                    }
+                }
+            }
+            block_info.push(num_defs);
+
+            // Write predecessor indices
+            let max_defs = max_defs_per_block as usize;
+            for p in 0..max_defs {
+                if p < num_preds {
+                    block_info.push(preds[p].as_u32());
+                } else {
+                    block_info.push(0xFFFFFFFF);
+                }
+            }
+        }
+
+        (block_info, def_sites)
+    }
 }

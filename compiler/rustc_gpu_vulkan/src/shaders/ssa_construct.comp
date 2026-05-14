@@ -1,0 +1,97 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// SSA construction on GPU:
+// 1. Identify variable definitions (assignments)
+// 2. Compute dominance frontiers
+// 3. Insert phi nodes at merge points
+//
+// This is a simplified version that works on basic blocks in parallel.
+
+// Block configuration: [num_preds, pred_0, pred_1, num_defs, def_0_local, ...]
+layout(set = 0, binding = 0) readonly buffer BlockInfo {
+    uint data[];
+} block_info;
+
+// Definition sites: for each block, which locals are defined
+layout(set = 0, binding = 1) readonly buffer DefSites {
+    uint data[];
+} def_sites;
+
+// Dominance frontier bitmap: for each block, which blocks are in its DF
+layout(set = 0, binding = 2) buffer DominanceFrontier {
+    uint data[];
+} dom_frontier;
+
+// Phi node insertion points: for each block, which locals need phi nodes
+layout(set = 0, binding = 3) buffer PhiNodes {
+    uint data[];
+} phi_nodes;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint num_locals;
+    uint max_defs_per_block;
+} pc;
+
+// Compute dominance frontier for each block:
+// DF[block] = union of DF[pred] for all preds
+// A block needs a phi for local X if:
+//   - X is defined in a block that dominates a predecessor of this block
+//   - But this block does not dominate the predecessor
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+    
+    uint info_offset = block_idx * (2 + pc.max_defs_per_block);
+    uint num_preds = block_info.data[info_offset];
+    uint num_defs = block_info.data[info_offset + 1];
+    
+    // For each predecessor, check if any of their defs reach this block
+    // and need phi nodes
+    for (uint p = 0; p < num_preds; p++) {
+        uint pred_idx = block_info.data[info_offset + 2 + p];
+        if (pred_idx >= pc.num_blocks) continue;
+        
+        uint pred_info_offset = pred_idx * (2 + pc.max_defs_per_block);
+        uint pred_num_defs = block_info.data[pred_info_offset + 1];
+        
+        for (uint d = 0; d < pred_num_defs; d++) {
+            uint local = def_sites.data[pred_idx * pc.max_defs_per_block + d];
+            if (local >= pc.num_locals) continue;
+            
+            // Check if this block already defines this local
+            bool already_defined = false;
+            for (uint my_d = 0; my_d < num_defs; my_d++) {
+                if (def_sites.data[block_idx * pc.max_defs_per_block + my_d] == local) {
+                    already_defined = true;
+                    break;
+                }
+            }
+            
+            if (!already_defined) {
+                // This local needs a phi node in this block
+                uint word = local / 32;
+                uint bit = local % 32;
+                uint phi_word = block_idx * ((pc.num_locals + 31) / 32) + word;
+                if (phi_word < pc.num_blocks * ((pc.num_locals + 31) / 32)) {
+                    atomicOr(phi_nodes.data[phi_word], 1u << bit);
+                }
+            }
+        }
+    }
+    
+    // Mark this block in the dominance frontier of its predecessors
+    // (simplified: every merge point is in the DF of its preds)
+    if (num_preds > 1) {
+        for (uint p = 0; p < num_preds; p++) {
+            uint pred_idx = block_info.data[info_offset + 2 + p];
+            if (pred_idx >= pc.num_blocks) continue;
+            uint df_word = pred_idx * ((pc.num_blocks + 31) / 32) + (block_idx / 32);
+            uint df_bit = block_idx % 32;
+            atomicOr(dom_frontier.data[df_word], 1u << df_bit);
+        }
+    }
+}
