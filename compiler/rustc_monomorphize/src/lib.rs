@@ -14,6 +14,7 @@ use rustc_span::ErrorGuaranteed;
 
 mod collector;
 mod errors;
+mod gpu_collector;
 mod graph_checks;
 mod mono_checks;
 mod partitioning;
