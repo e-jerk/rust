@@ -207,6 +207,78 @@ pub fn resolve_edge<'tcx>(
     Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), def_id, *args).ok().flatten()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gpu_mono_action_size() {
+        assert_eq!(std::mem::size_of::<GpuMonoAction>(), 16);
+        assert_eq!(std::mem::align_of::<GpuMonoAction>(), 4);
+    }
+
+    #[test]
+    fn test_gpu_edge_size() {
+        assert_eq!(std::mem::size_of::<GpuEdge>(), 16);
+        assert_eq!(std::mem::align_of::<GpuEdge>(), 4);
+    }
+
+    #[test]
+    fn test_action_kinds() {
+        assert_eq!(ACTION_CALL, 1);
+        assert_eq!(ACTION_DROP, 2);
+        assert_eq!(ACTION_CAST, 3);
+        assert_eq!(ACTION_CONST, 4);
+    }
+
+    #[test]
+    fn test_action_roundtrip() {
+        let action = GpuMonoAction {
+            kind: ACTION_CALL,
+            def_id_index: 42,
+            args_idx: 7,
+            def_id_krate: 1,
+        };
+
+        // Write to bytes
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &action as *const _ as *const u8,
+                std::mem::size_of::<GpuMonoAction>()
+            )
+        };
+
+        // Read back
+        let read_back = unsafe {
+            std::ptr::read(bytes.as_ptr() as *const GpuMonoAction)
+        };
+
+        assert_eq!(read_back.kind, ACTION_CALL);
+        assert_eq!(read_back.def_id_index, 42);
+        assert_eq!(read_back.args_idx, 7);
+        assert_eq!(read_back.def_id_krate, 1);
+    }
+
+    #[test]
+    fn test_batch_structure() {
+        let batch = SerializedBatch {
+            actions: vec![
+                GpuMonoAction { kind: ACTION_CALL, def_id_index: 1, args_idx: 0, def_id_krate: 0 },
+                GpuMonoAction { kind: ACTION_DROP, def_id_index: 2, args_idx: 0, def_id_krate: 0 },
+            ],
+            body_offsets: vec![0, 1, 2],
+            generic_args_table: vec![], // would have real args in production
+            instances: vec![],
+        };
+
+        assert_eq!(batch.actions.len(), 2);
+        assert_eq!(batch.body_offsets.len(), 3);
+        assert_eq!(batch.body_offsets[0], 0);
+        assert_eq!(batch.body_offsets[1], 1);
+        assert_eq!(batch.body_offsets[2], 2);
+    }
+}
+
 pub fn gpu_collect_mono_items<'tcx>(
     tcx: TyCtxt<'tcx>,
     roots: Vec<MonoItem<'tcx>>,

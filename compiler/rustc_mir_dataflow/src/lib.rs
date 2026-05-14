@@ -26,6 +26,7 @@ pub mod debuginfo;
 mod drop_flag_effects;
 mod errors;
 mod framework;
+pub mod gpu_engine;
 pub mod impls;
 pub mod move_paths;
 pub mod points;

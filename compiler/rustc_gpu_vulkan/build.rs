@@ -1,25 +1,49 @@
 use std::process::Command;
 
-fn main() {
-    let shader_path = "src/shaders/mono_collect.comp";
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let spv_path = format!("{}/mono_collect.spv", out_dir);
-    
+fn compile_shader(shader_path: &str, out_dir: &str, env_name: &str) {
+    let shader_name = std::path::Path::new(shader_path)
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let spv_path = format!("{}/{}.spv", out_dir, shader_name);
+
     let output = Command::new("glslangValidator")
         .args(["-V", shader_path, "-o", &spv_path, "--target-env", "vulkan1.2"])
         .output();
-    
+
     match output {
         Ok(out) if out.status.success() => {
             println!("cargo:rerun-if-changed={}", shader_path);
-            println!("cargo:rustc-env=MONO_COLLECT_SPV={}", spv_path);
+            println!("cargo:rustc-env={}={}", env_name, spv_path);
         }
         Ok(out) => {
-            eprintln!("glslangValidator stderr: {}", String::from_utf8_lossy(&out.stderr));
-            panic!("Failed to compile shader");
+            eprintln!(
+                "glslangValidator stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            panic!("Failed to compile shader {}", shader_path);
         }
         Err(e) => {
-            eprintln!("Warning: glslangValidator not found: {}. SPIR-V will not be compiled.", e);
+            eprintln!(
+                "Warning: glslangValidator not found: {}. SPIR-V will not be compiled.",
+                e
+            );
         }
     }
+}
+
+fn main() {
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+
+    compile_shader(
+        "src/shaders/mono_collect.comp",
+        &out_dir,
+        "MONO_COLLECT_SPV",
+    );
+    compile_shader(
+        "src/shaders/dataflow.comp",
+        &out_dir,
+        "DATAFLOW_SPV",
+    );
 }

@@ -2,6 +2,7 @@
 
 pub mod buffer;
 pub mod context;
+pub mod dataflow;
 pub mod dispatch;
 pub mod shader;
 
@@ -20,6 +21,16 @@ impl GpuBackend {
         let context = context::GpuContext::new().ok()?;
         Some(GpuBackend { context: Arc::new(context) })
     }
+
+    pub fn create_buffer(&self, size: u64) -> Option<buffer::GpuBuffer> {
+        buffer::GpuBuffer::new_host_visible(
+            &self.context.device,
+            self.context.physical_device,
+            &self.context.instance,
+            size,
+        )
+        .ok()
+    }
 }
 
 pub fn load_mono_collect_shader() -> Option<Vec<u8>> {
@@ -27,5 +38,37 @@ pub fn load_mono_collect_shader() -> Option<Vec<u8>> {
         std::fs::read(spv_path).ok()
     } else {
         None
+    }
+}
+
+pub fn load_dataflow_shader() -> Option<Vec<u8>> {
+    if let Ok(spv_path) = std::env::var("DATAFLOW_SPV") {
+        std::fs::read(spv_path).ok()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_buffer_size_calculation_u32() {
+        let data: Vec<u32> = vec![1, 2, 3, 4, 5];
+        let expected = data.len() * std::mem::size_of::<u32>();
+        assert_eq!(expected, 20);
+    }
+
+    #[test]
+    fn test_buffer_size_calculation_u8() {
+        let data: Vec<u8> = vec![0; 64];
+        let expected = data.len() * std::mem::size_of::<u8>();
+        assert_eq!(expected, 64);
+    }
+
+    #[test]
+    fn test_buffer_size_calculation_empty() {
+        let data: Vec<u32> = vec![];
+        let expected = data.len() * std::mem::size_of::<u32>();
+        assert_eq!(expected, 0);
     }
 }

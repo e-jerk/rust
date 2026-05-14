@@ -4473,6 +4473,7 @@ dependencies = [
  "rustc_abi",
  "rustc_data_structures",
  "rustc_errors",
+ "rustc_gpu_vulkan",
  "rustc_graphviz",
  "rustc_hir",
  "rustc_index",

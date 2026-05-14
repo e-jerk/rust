@@ -1,0 +1,72 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer BlockConfig {
+    uint statement_count;
+    uint terminator_kind;
+    uint successor_count;
+    uint successor_0;
+    uint successor_1;
+} blocks[];
+
+layout(set = 0, binding = 1) readonly buffer Effects {
+    uint data[];
+} effects;
+
+layout(set = 0, binding = 2) buffer EntryStates {
+    uint bits[];
+} entry_states;
+
+layout(set = 0, binding = 3) buffer ExitStates {
+    uint bits[];
+} exit_states;
+
+layout(set = 0, binding = 4) buffer Convergence {
+    uint changed;
+} convergence;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint bitset_words;
+    uint effects_stride;
+} pc;
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+
+    BlockConfig block = blocks[block_idx];
+    uint entry_offset = block_idx * pc.bitset_words;
+
+    uint state[64]; // max 64 words = 2048 bits
+    for (uint i = 0; i < pc.bitset_words; i++) {
+        state[i] = entry_states.bits[entry_offset + i];
+    }
+
+    // Apply statement effects
+    uint effect_base = block_idx * pc.effects_stride;
+    for (uint stmt = 0; stmt < block.statement_count; stmt++) {
+        uint base = effect_base + stmt * 3u;
+        uint word_idx = effects.data[base];
+        uint gen_mask = effects.data[base + 1u];
+        uint kill_mask = effects.data[base + 2u];
+        state[word_idx] |= gen_mask;
+        state[word_idx] &= ~kill_mask;
+    }
+
+    // Write exit state and check convergence
+    uint exit_offset = block_idx * pc.bitset_words;
+    bool changed = false;
+    for (uint i = 0; i < pc.bitset_words; i++) {
+        uint old = exit_states.bits[exit_offset + i];
+        if (old != state[i]) {
+            changed = true;
+        }
+        exit_states.bits[exit_offset + i] = state[i];
+    }
+
+    if (changed) {
+        convergence.changed = 1u;
+    }
+}

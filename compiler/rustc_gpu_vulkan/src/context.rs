@@ -3,6 +3,7 @@ use ash::vk;
 pub struct GpuContext {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
+    pub physical_device: vk::PhysicalDevice,
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family_index: u32,
@@ -50,6 +51,7 @@ impl GpuContext {
         Ok(GpuContext {
             entry,
             instance,
+            physical_device,
             device,
             queue,
             queue_family_index,
