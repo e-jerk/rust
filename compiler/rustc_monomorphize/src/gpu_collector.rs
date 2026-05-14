@@ -12,7 +12,7 @@ use rustc_middle::ty::{self, GenericArgsRef, Instance, Ty, TyCtxt};
 
 use crate::collector::UsageMap;
 
-const GPU_BATCH_SIZE: usize = 1024;
+const GPU_BATCH_SIZE: usize = 65536; // Mega-batch: process up to 64K items at once
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
