@@ -215,70 +215,90 @@ pub fn gpu_collect_mono_items<'tcx>(
     let mut total_cpu_time = std::time::Duration::ZERO;
     let mut rounds = 0;
 
-    while !queue.is_empty() {
+    // Pipelined processing: prepare next batch while GPU works on current
+    let mut pending_gpu = false;
+    let mut next_batch: Option<(Vec<MonoItem<'tcx>>, SerializedBatch<'tcx>)> = None;
+
+    while !queue.is_empty() || pending_gpu {
         rounds += 1;
-        let batch_size = GPU_BATCH_SIZE.min(queue.len());
-        let batch: Vec<_> = queue.drain(..batch_size).collect();
-
-        // Serialize on CPU
-        let cpu_start = std::time::Instant::now();
-        let serialized = serialize_batch(tcx, &batch);
         
-        total_cpu_time += cpu_start.elapsed();
+        // If we have a pending GPU batch, wait for it and process results
+        if pending_gpu {
+            let gpu_start = std::time::Instant::now();
+            
+            // Read atomic counter to know how many edges were written
+            let counter = persistent_bufs.counter_buf.read::<u32>(1);
+            let edge_count = counter[0] as usize;
+            let edges = persistent_bufs.edges_buf.read::<GpuEdge>(edge_count.min(MAX_EDGES_PER_BATCH));
+            
+            total_gpu_time += gpu_start.elapsed();
+            
+            // Resolve edges on CPU (can overlap with next GPU dispatch)
+            let cpu_start = std::time::Instant::now();
+            
+            if let Some((batch, serialized)) = next_batch.take() {
+                for edge in &edges {
+                    if edge.def_id_krate == 0 && edge.def_id_index == 0 {
+                        continue;
+                    }
+                    if let Some(instance) = resolve_edge(tcx, *edge, &serialized) {
+                        let mono_item = MonoItem::Fn(instance);
+                        let source_idx = edge.source_idx as usize;
+                        if source_idx < batch.len() {
+                            let source_item = batch[source_idx];
+                            usage_map.record_usage(source_item, mono_item);
+                        }
 
-        // GPU dispatch
-        let gpu_start = std::time::Instant::now();
-        
-        // Write to persistent buffers
-        persistent_bufs.actions_buf.write(&serialized.actions);
-        persistent_bufs.offsets_buf.write(&serialized.body_offsets);
-        persistent_bufs.reset_counter();
-
-        // Dispatch compute shader
-        let dispatch = rustc_gpu_vulkan::dispatch::GpuDispatch::new(&backend.context);
-        dispatch.dispatch_with_counter(
-            &pipeline,
-            &persistent_bufs.actions_buf,
-            &persistent_bufs.offsets_buf,
-            &persistent_bufs.edges_buf,
-            Some(&persistent_bufs.counter_buf),
-            serialized.instances.len() as u32,
-        ).ok()?;
-        
-        total_gpu_time += gpu_start.elapsed();
-
-        // Read back on CPU
-        let cpu_start = std::time::Instant::now();
-        
-        // Read atomic counter to know how many edges were written
-        let counter = persistent_bufs.counter_buf.read::<u32>(1);
-        let edge_count = counter[0] as usize;
-        let edges = persistent_bufs.edges_buf.read::<GpuEdge>(edge_count.min(MAX_EDGES_PER_BATCH));
-
-        // Resolve edges
-        for edge in &edges {
-            if edge.def_id_krate == 0 && edge.def_id_index == 0 {
-                continue; // skip empty slots
-            }
-            if let Some(instance) = resolve_edge(tcx, *edge, &serialized) {
-                let mono_item = MonoItem::Fn(instance);
-                let source_idx = edge.source_idx as usize;
-                if source_idx < batch.len() {
-                    let source_item = batch[source_idx];
-                    usage_map.record_usage(source_item, mono_item);
-                }
-
-                if visited.insert(mono_item) {
-                    queue.push_back(mono_item);
+                        if visited.insert(mono_item) {
+                            queue.push_back(mono_item);
+                        }
+                    }
                 }
             }
+            total_cpu_time += cpu_start.elapsed();
         }
-        total_cpu_time += cpu_start.elapsed();
+        
+        // If queue is empty and no pending GPU work, we're done
+        if queue.is_empty() && !pending_gpu {
+            break;
+        }
+        
+        // Prepare and dispatch next batch if items available
+        if !queue.is_empty() {
+            let batch_size = GPU_BATCH_SIZE.min(queue.len());
+            let batch: Vec<_> = queue.drain(..batch_size).collect();
+            
+            let cpu_start = std::time::Instant::now();
+            let serialized = serialize_batch(tcx, &batch);
+            total_cpu_time += cpu_start.elapsed();
+            
+            // Write to persistent buffers and dispatch GPU
+            let gpu_start = std::time::Instant::now();
+            
+            persistent_bufs.actions_buf.write(&serialized.actions);
+            persistent_bufs.offsets_buf.write(&serialized.body_offsets);
+            persistent_bufs.reset_counter();
+
+            let dispatch = rustc_gpu_vulkan::dispatch::GpuDispatch::new(&backend.context);
+            dispatch.dispatch_with_counter(
+                &pipeline,
+                &persistent_bufs.actions_buf,
+                &persistent_bufs.offsets_buf,
+                &persistent_bufs.edges_buf,
+                Some(&persistent_bufs.counter_buf),
+                serialized.instances.len() as u32,
+            ).ok()?;
+            
+            total_gpu_time += gpu_start.elapsed();
+            
+            next_batch = Some((batch, serialized));
+            pending_gpu = true;
+        }
     }
 
     // Print performance stats
     eprintln!(
-        "[GPU-MONO] {} rounds, CPU: {:?}, GPU: {:?}, total items: {}",
+        "[GPU-MONO] {} rounds, CPU: {:?}, GPU: {:?}, total items: {}, pipelined: true",
         rounds,
         total_cpu_time,
         total_gpu_time,
