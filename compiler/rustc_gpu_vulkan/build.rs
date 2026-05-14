@@ -46,4 +46,9 @@ fn main() {
         &out_dir,
         "DATAFLOW_SPV",
     );
+    compile_shader(
+        "src/shaders/dead_store_elim.comp",
+        &out_dir,
+        "DEAD_STORE_ELIM_SPV",
+    );
 }

@@ -1,0 +1,102 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Block configuration buffer
+layout(set = 0, binding = 0) readonly buffer BlockConfigs {
+    uint data[];
+} configs;
+
+// Effects buffer: per-statement encoded effects
+layout(set = 0, binding = 1) readonly buffer Effects {
+    uint data[];
+} effects;
+
+// Entry states (live locals at block entry) - read/write for backward analysis
+layout(set = 0, binding = 2) buffer EntryStates {
+    uint data[];
+} entry_states;
+
+// Exit states (live locals at block exit) - read/write
+layout(set = 0, binding = 3) buffer ExitStates {
+    uint data[];
+} exit_states;
+
+// Convergence flag: 0 = converged, 1 = changed this round
+layout(set = 0, binding = 4) buffer Convergence {
+    uint changed;
+} convergence;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint bitset_words;
+    uint effects_stride;
+} pc;
+
+// Block config encoding (4 uints per block):
+// [0] = statement_count
+// [1] = terminator_kind
+// [2] = successor_count | (successor_0 << 16)
+// [3] = successor_1 | (predecessor_count << 16)
+
+#define EFFECT_NOP 0
+#define EFFECT_KILL 1  // Assignment to local (kills previous value)
+#define EFFECT_GEN 2   // Use of local (makes it live)
+
+// Backward dataflow: compute exit state from entry state
+// For liveness: exit = union of all successor entries
+//              entry = gen | (exit - kill)
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+    
+    uint config_base = block_idx * 4;
+    uint stmt_count = configs.data[config_base];
+    uint terminator_kind = configs.data[config_base + 1];
+    
+    // Read exit state for this block
+    uint state_start = block_idx * pc.bitset_words;
+    uint state[32]; // Max 1024 locals (32 * 32)
+    
+    for (uint w = 0; w < pc.bitset_words; w++) {
+        state[w] = exit_states.data[state_start + w];
+    }
+    
+    // Apply effects backward (from last statement to first)
+    // For liveness:
+    // - GEN (use): local becomes live -> state |= (1 << local)
+    // - KILL (def): local dies -> state &= ~(1 << local)
+    
+    for (int stmt_idx = int(stmt_count) - 1; stmt_idx >= 0; stmt_idx--) {
+        uint effect = effects.data[block_idx * pc.effects_stride + uint(stmt_idx)];
+        uint kind = effect >> 24;
+        uint local = effect & 0xFFFFFF;
+        
+        if (local >= pc.bitset_words * 32) continue;
+        
+        uint word = local / 32;
+        uint bit = local % 32;
+        uint mask = 1u << bit;
+        
+        if (kind == EFFECT_GEN) {
+            state[word] |= mask;
+        } else if (kind == EFFECT_KILL) {
+            state[word] &= ~mask;
+        }
+    }
+    
+    // Write new entry state
+    bool changed = false;
+    for (uint w = 0; w < pc.bitset_words; w++) {
+        uint old = entry_states.data[state_start + w];
+        if (old != state[w]) {
+            entry_states.data[state_start + w] = state[w];
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        atomicOr(convergence.changed, 1);
+    }
+}

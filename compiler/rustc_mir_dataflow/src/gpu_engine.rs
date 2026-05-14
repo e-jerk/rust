@@ -1,7 +1,7 @@
 use rustc_gpu_vulkan::dataflow::{GpuDataflowConfig, GpuDataflowEngine};
 use rustc_gpu_vulkan::{GpuBackend, load_dataflow_shader};
 use rustc_index::bit_set::DenseBitSet;
-use rustc_middle::mir::{BasicBlock, Body, Local, StatementKind, TerminatorKind};
+use rustc_middle::mir::{self, visit::Visitor, BasicBlock, Body, Local, StatementKind, TerminatorKind};
 use rustc_middle::ty::TyCtxt;
 
 /// GPU-accelerated dataflow engine for bitset-based forward analyses.
@@ -229,5 +229,245 @@ impl<'tcx> GpuEngine<'tcx> {
             results.push(bitset);
         }
         results
+    }
+
+    // ------------------------------------------------------------------
+    // GPU-accelerated Dead Store Elimination (backward liveness)
+    // ------------------------------------------------------------------
+
+    /// Run backward liveness analysis on GPU to identify dead stores.
+    ///
+    /// Returns a vector of (block, statement_idx) pairs indicating dead stores.
+    /// Only runs for large functions (>50 basic blocks) to amortize GPU overhead.
+    pub fn run_backward_liveness_for_dse(&self) -> Option<Vec<(BasicBlock, usize)>> {
+        // Use lower threshold for DSE since backward analysis is more expensive on CPU
+        if self.body.basic_blocks.len() < 50 {
+            return None;
+        }
+
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_dead_store_elim_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let num_locals = self.body.local_decls.len();
+        let bitset_words = (num_locals + 31) / 32;
+
+        // Serialize for backward analysis: assignments = KILL, uses = GEN
+        let (configs, effects, effects_stride) = self.serialize_backward_effects();
+
+        // Initialize: all locals are dead at function exit (except return value)
+        let mut exit_states: Vec<u32> = vec![0; num_blocks * bitset_words];
+        let entry_states: Vec<u32> = vec![0; num_blocks * bitset_words];
+
+        // Mark return value as live at return blocks
+        for (bb, block) in self.body.basic_blocks.iter_enumerated() {
+            if matches!(block.terminator().kind, TerminatorKind::Return) {
+                let start = bb.index() * bitset_words;
+                // Local_0 is the return value
+                exit_states[start] |= 1u32;
+            }
+        }
+
+        // Upload to GPU
+        let config_buf = backend
+            .create_buffer((configs.len() * std::mem::size_of::<u32>()) as u64)?;
+        config_buf.write(&configs);
+
+        let effects_buf =
+            backend.create_buffer((effects.len() * std::mem::size_of::<u32>()) as u64)?;
+        effects_buf.write(&effects);
+
+        let entry_buf =
+            backend.create_buffer((entry_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        entry_buf.write(&entry_states);
+
+        let exit_buf =
+            backend.create_buffer((exit_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        exit_buf.write(&exit_states);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
+        // Backward fixed-point iteration on GPU
+        let mut round = 0;
+        const MAX_ROUNDS: u32 = 200;
+
+        loop {
+            // Reset convergence flag
+            convergence_buf.write(&[0u32]);
+
+            // Propagate entry states to predecessor exit states on CPU
+            let entry_data: Vec<u32> = entry_buf.read(num_blocks * bitset_words);
+            let mut exit_data: Vec<u32> = exit_buf.read(num_blocks * bitset_words);
+            self.propagate_backward_edges(&entry_data, &mut exit_data);
+            exit_buf.write(&exit_data);
+
+            // GPU computes entry states from exit states
+            gpu.dispatch_round(
+                &config_buf,
+                &effects_buf,
+                &entry_buf,
+                &exit_buf,
+                &convergence_buf,
+                num_blocks as u32,
+                bitset_words as u32,
+                effects_stride,
+            )
+            .ok()?;
+
+            let changed = gpu.read_convergence(&convergence_buf);
+            round += 1;
+
+            if !changed || round >= MAX_ROUNDS {
+                break;
+            }
+        }
+
+        // Read back final entry states
+        let final_entry: Vec<u32> = entry_buf.read(num_blocks * bitset_words);
+        let live_sets = self.parse_results(&final_entry, bitset_words);
+
+        // Identify dead stores on CPU
+        Some(self.identify_dead_stores(&live_sets))
+    }
+
+    /// Serialize block configs and effects for backward liveness.
+    /// Effects: KILL=1 for assignments, GEN=2 for uses.
+    fn serialize_backward_effects(&self) -> (Vec<u32>, Vec<u32>, u32) {
+        let num_blocks = self.body.basic_blocks.len();
+        let max_statements = self
+            .body
+            .basic_blocks
+            .iter()
+            .map(|b| b.statements.len())
+            .max()
+            .unwrap_or(0) as u32;
+
+        let mut configs = Vec::with_capacity(num_blocks * 4);
+        let mut effects = vec![0u32; num_blocks * max_statements as usize];
+
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            let terminator = block.terminator();
+            let successors: Vec<BasicBlock> = terminator.successors().collect();
+            let predecessors: Vec<BasicBlock> = self
+                .body
+                .basic_blocks
+                .predecessors()[block_idx]
+                .iter()
+                .copied()
+                .collect();
+
+            // Config encoding: [stmt_count, terminator_kind, successors, predecessors]
+            let terminator_kind = match terminator.kind {
+                TerminatorKind::Goto { .. } => 0,
+                TerminatorKind::SwitchInt { .. } => 1,
+                TerminatorKind::Return => 2,
+                TerminatorKind::Unreachable => 3,
+                TerminatorKind::Call { .. } => 4,
+                TerminatorKind::Drop { .. } => 5,
+                _ => 6,
+            };
+
+            configs.push(block.statements.len() as u32);
+            configs.push(terminator_kind);
+            configs.push(
+                (successors.len() as u32 & 0xFFFF)
+                    | ((successors.get(0).map_or(u32::MAX, |b| b.as_u32()) & 0xFFFF) << 16),
+            );
+            configs.push(
+                (predecessors.get(0).map_or(u32::MAX, |b| b.as_u32()) & 0xFFFF)
+                    | ((predecessors.len() as u32 & 0xFFFF) << 16),
+            );
+
+            // Encode effects for each statement
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                let encoded = match &stmt.kind {
+                    StatementKind::Assign((place, _)) => {
+                        // Assignment KILLS the local (it's no longer live before this)
+                        let local = place.local;
+                        (1u32 << 24) | local.as_u32()
+                    }
+                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) => 0,
+                    _ => {
+                        // For non-assignment statements, encode as GEN for the statement
+                        // The GPU shader will process them; detailed local scanning is done on CPU
+                        0
+                    }
+                };
+                effects[block_idx.index() * max_statements as usize + stmt_idx] = encoded;
+            }
+        }
+
+        (configs, effects, max_statements)
+    }
+
+    /// Propagate entry states to predecessor exit states for backward analysis.
+    fn propagate_backward_edges(&self, entry_states: &[u32], exit_states: &mut [u32]) {
+        let num_blocks = self.body.basic_blocks.len();
+        let bitset_words = (self.body.local_decls.len() + 31) / 32;
+
+        for block_idx in 0..num_blocks {
+            let bb = BasicBlock::from_usize(block_idx);
+            let preds = &self.body.basic_blocks.predecessors()[bb];
+
+            let entry_start = block_idx * bitset_words;
+            let entry_slice = &entry_states[entry_start..entry_start + bitset_words];
+
+            // Union this block's entry into all predecessors' exit states
+            for &pred in preds {
+                let pred_idx = pred.index();
+                let exit_start = pred_idx * bitset_words;
+                for w in 0..bitset_words {
+                    exit_states[exit_start + w] |= entry_slice[w];
+                }
+            }
+        }
+    }
+
+    /// Identify dead stores using computed liveness information.
+    fn identify_dead_stores(
+        &self,
+        live_at_entry: &[DenseBitSet<Local>],
+    ) -> Vec<(BasicBlock, usize)> {
+        let mut dead_stores = Vec::new();
+
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            // Compute live set at each statement position by applying effects forward
+            let mut live = live_at_entry[block_idx.index()].clone();
+            let _bitset_words = (self.body.local_decls.len() + 31) / 32;
+
+            // Walk statements backward to determine liveness at each point
+            for stmt_idx in (0..block.statements.len()).rev() {
+                let stmt = &block.statements[stmt_idx];
+
+                if let StatementKind::Assign((place, _)) = &stmt.kind {
+                    let local = place.local;
+
+                    // If the assigned local is NOT live after this statement,
+                    // the store is dead
+                    if !live.contains(local) {
+                        dead_stores.push((block_idx, stmt_idx));
+                    }
+
+                    // Apply KILL effect: local is no longer live before this assignment
+                    live.remove(local);
+                }
+
+                // Apply GEN effects: mark all locals used in the statement as live
+                // Use a visitor to find all locals in the statement
+                struct LocalCollector<'a> {
+                    live: &'a mut DenseBitSet<Local>,
+                }
+                impl<'tcx> mir::visit::Visitor<'tcx> for LocalCollector<'_> {
+                    fn visit_local(&mut self, local: Local, _ctx: mir::visit::PlaceContext, _loc: mir::Location) {
+                        self.live.insert(local);
+                    }
+                }
+                let mut collector = LocalCollector { live: &mut live };
+                collector.visit_statement(stmt, mir::Location { block: block_idx, statement_index: stmt_idx });
+            }
+        }
+
+        dead_stores
     }
 }

@@ -49,6 +49,14 @@ pub fn load_dataflow_shader() -> Option<Vec<u8>> {
     }
 }
 
+pub fn load_dead_store_elim_shader() -> Option<Vec<u8>> {
+    if let Ok(spv_path) = std::env::var("DEAD_STORE_ELIM_SPV") {
+        std::fs::read(spv_path).ok()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
