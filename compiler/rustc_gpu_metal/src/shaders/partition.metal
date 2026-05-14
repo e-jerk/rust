@@ -11,7 +11,7 @@ kernel void partition(
     const device uint* edge_list [[buffer(0)]],
     const device uint* edge_offsets [[buffer(1)]],
     device uint* labels [[buffer(2)]],
-    device uint* label_counts [[buffer(3)]],
+    device atomic_uint* label_counts [[buffer(3)]],
     device atomic_uint* convergence [[buffer(4)]],
     constant PushConstants& pc [[buffer(5)]],
     uint3 thread_position_in_grid [[thread_position_in_grid]]
@@ -65,7 +65,7 @@ kernel void partition(
     
     // Only change if best label is different, not full, and has at least 2 neighbors
     if (best_label != current_label && best_count >= 2) {
-        uint new_size = label_counts[best_label];
+        uint new_size = atomic_load_explicit(&label_counts[best_label], memory_order_relaxed);
         if (new_size < pc.max_size) {
             labels[node_idx] = best_label;
             atomic_fetch_add_explicit(&label_counts[best_label], 1u, memory_order_relaxed);

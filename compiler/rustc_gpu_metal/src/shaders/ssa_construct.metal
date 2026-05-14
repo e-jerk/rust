@@ -10,8 +10,8 @@ struct PushConstants {
 kernel void ssa_construct(
     const device uint* block_info [[buffer(0)]],
     const device uint* def_sites [[buffer(1)]],
-    device uint* dom_frontier [[buffer(2)]],
-    device uint* phi_nodes [[buffer(3)]],
+    device atomic_uint* dom_frontier [[buffer(2)]],
+    device atomic_uint* phi_nodes [[buffer(3)]],
     constant PushConstants& pc [[buffer(4)]],
     uint3 thread_position_in_grid [[thread_position_in_grid]]
 ) {

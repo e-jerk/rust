@@ -9,7 +9,7 @@ struct PushConstants {
 kernel void loop_detect(
     const device uint* block_info [[buffer(0)]],
     device uint* reachability [[buffer(1)]],
-    device uint* loop_headers [[buffer(2)]],
+    device atomic_uint* loop_headers [[buffer(2)]],
     constant PushConstants& pc [[buffer(3)]],
     uint3 thread_position_in_grid [[thread_position_in_grid]]
 ) {

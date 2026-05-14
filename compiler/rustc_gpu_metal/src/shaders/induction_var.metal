@@ -9,7 +9,7 @@ struct PushConstants {
 
 kernel void induction_var(
     const device uint* block_info [[buffer(0)]],
-    device uint* induction_vars [[buffer(1)]],
+    device atomic_uint* induction_vars [[buffer(1)]],
     constant PushConstants& pc [[buffer(2)]],
     uint3 thread_position_in_grid [[thread_position_in_grid]]
 ) {

@@ -8,7 +8,7 @@ struct PushConstants {
 
 kernel void alias_analysis(
     const device uint* accesses [[buffer(0)]],
-    device uint* alias_matrix [[buffer(1)]],
+    device atomic_uint* alias_matrix [[buffer(1)]],
     constant PushConstants& pc [[buffer(2)]],
     uint3 thread_position_in_grid [[thread_position_in_grid]]
 ) {
