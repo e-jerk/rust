@@ -89,6 +89,14 @@ pub fn load_ssa_construct_shader() -> Option<Vec<u8>> {
     }
 }
 
+pub fn load_alias_analysis_shader() -> Option<Vec<u8>> {
+    if let Ok(spv_path) = std::env::var("ALIAS_ANALYSIS_SPV") {
+        std::fs::read(spv_path).ok()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

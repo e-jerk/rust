@@ -1,0 +1,75 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Memory access analysis for alias detection on GPU.
+// 
+// For each memory access (load/store), we determine if it may alias
+// with other accesses in the same function.
+//
+// This is a simplified flow-insensitive analysis: two accesses alias if
+// they could refer to the same memory location.
+
+// Access descriptors: one per statement that accesses memory
+// Encoding: (local_idx << 16) | access_kind
+// access_kind: 1 = read, 2 = write, 3 = read-write
+layout(set = 0, binding = 0) readonly buffer AccessDescriptors {
+    uint data[];
+} accesses;
+
+// Alias matrix output: symmetric matrix of alias relations
+// For N accesses, we store N * N bits (rounded up to words)
+// alias[i][j] = 1 if access i and j may alias
+layout(set = 0, binding = 1) buffer AliasMatrix {
+    uint data[];
+} alias_matrix;
+
+layout(push_constant) uniform PushConstants {
+    uint num_accesses;
+    uint num_locals;
+} pc;
+
+// Simple alias rules:
+// - Same local -> may alias
+// - Different locals -> don't alias (simplified)
+// - In reality, we'd need type-based and offset-based analysis
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.num_accesses) return;
+    
+    uint access_i = accesses.data[idx];
+    uint local_i = (access_i >> 16) & 0xFFFF;
+    
+    // Compare with all accesses j >= i (symmetric matrix)
+    for (uint j = idx; j < pc.num_accesses; j++) {
+        uint access_j = accesses.data[j];
+        uint local_j = (access_j >> 16) & 0xFFFF;
+        
+        bool may_alias = false;
+        
+        if (local_i == local_j && local_i != 0xFFFF) {
+            // Same local -> may alias
+            may_alias = true;
+        }
+        
+        // In a real implementation, we'd also check:
+        // - Type compatibility
+        // - Offset relationships
+        // - Pointer provenance
+        
+        if (may_alias) {
+            // Set bit (idx, j) and (j, idx) in symmetric matrix
+            uint matrix_size = (pc.num_accesses + 31) / 32;
+            uint word_idx = idx * matrix_size + (j / 32);
+            uint bit_idx = j % 32;
+            atomicOr(alias_matrix.data[word_idx], 1u << bit_idx);
+            
+            if (idx != j) {
+                uint word_idx2 = j * matrix_size + (idx / 32);
+                uint bit_idx2 = idx % 32;
+                atomicOr(alias_matrix.data[word_idx2], 1u << bit_idx2);
+            }
+        }
+    }
+}

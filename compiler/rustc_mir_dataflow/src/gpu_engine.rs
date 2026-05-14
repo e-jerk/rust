@@ -1181,4 +1181,108 @@ impl<'tcx> GpuEngine<'tcx> {
 
         (block_info, def_sites)
     }
+
+    // ------------------------------------------------------------------
+    // GPU-accelerated Alias Analysis
+    // ------------------------------------------------------------------
+
+    /// Run flow-insensitive alias analysis on GPU.
+    ///
+    /// Returns a bitmap of which memory accesses may alias with each other.
+    pub fn run_alias_analysis(&self) -> Option<Vec<Vec<bool>>> {
+        if self.body.basic_blocks.len() < 30 {
+            return None;
+        }
+
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_alias_analysis_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        // Collect all memory accesses in the function
+        let mut accesses = Vec::new();
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                match &stmt.kind {
+                    StatementKind::Assign((place, _)) => {
+                        if let Some(local) = place.as_local() {
+                            accesses.push((block_idx, stmt_idx, local, 2u32)); // write
+                        }
+                    }
+                    _ => {
+                        // Check for reads via visitor
+                        struct ReadCollector<'a> {
+                            reads: &'a mut Vec<(BasicBlock, usize, Local, u32)>,
+                            block: BasicBlock,
+                            stmt: usize,
+                        }
+                        impl<'tcx> Visitor<'tcx> for ReadCollector<'_> {
+                            fn visit_local(&mut self, local: Local, ctx: mir::visit::PlaceContext, _loc: mir::Location) {
+                                if ctx.is_use() {
+                                    self.reads.push((self.block, self.stmt, local, 1u32));
+                                }
+                            }
+                        }
+                        let mut collector = ReadCollector {
+                            reads: &mut accesses,
+                            block: block_idx,
+                            stmt: stmt_idx,
+                        };
+                        collector.visit_statement(stmt, mir::Location { block: block_idx, statement_index: stmt_idx });
+                    }
+                }
+            }
+        }
+
+        let num_accesses = accesses.len();
+        if num_accesses == 0 || num_accesses > 1024 {
+            return None;
+        }
+
+        let num_locals = self.body.local_decls.len();
+        let matrix_words = (num_accesses + 31) / 32;
+
+        // Encode access descriptors
+        let descriptors: Vec<u32> = accesses
+            .iter()
+            .map(|(_, _, local, kind)| {
+                ((local.as_u32() & 0xFFFF) << 16) | (kind & 0xFFFF)
+            })
+            .collect();
+
+        let alias_matrix: Vec<u32> = vec![0; num_accesses * matrix_words];
+
+        let desc_buf = backend
+            .create_buffer((descriptors.len() * std::mem::size_of::<u32>()) as u64)?;
+        desc_buf.write(&descriptors);
+
+        let matrix_buf = backend
+            .create_buffer((alias_matrix.len() * std::mem::size_of::<u32>()) as u64)?;
+        matrix_buf.write(&alias_matrix);
+
+        // Dispatch alias analysis kernel
+        gpu.dispatch_alias_round(
+            &desc_buf,
+            &matrix_buf,
+            num_accesses as u32,
+            num_locals as u32,
+        )
+        .ok()?;
+
+        // Read back alias matrix
+        let matrix_data: Vec<u32> = matrix_buf.read(num_accesses * matrix_words);
+
+        // Convert to Vec<Vec<bool>>
+        let mut result = Vec::with_capacity(num_accesses);
+        for i in 0..num_accesses {
+            let mut row = Vec::with_capacity(num_accesses);
+            for j in 0..num_accesses {
+                let word_idx = i * matrix_words + (j / 32);
+                let bit_idx = j % 32;
+                row.push(matrix_data[word_idx] & (1u32 << bit_idx) != 0);
+            }
+            result.push(row);
+        }
+
+        Some(result)
+    }
 }

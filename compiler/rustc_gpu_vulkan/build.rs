@@ -71,4 +71,9 @@ fn main() {
         &out_dir,
         "SSA_CONSTRUCT_SPV",
     );
+    compile_shader(
+        "src/shaders/alias_analysis.comp",
+        &out_dir,
+        "ALIAS_ANALYSIS_SPV",
+    );
 }
