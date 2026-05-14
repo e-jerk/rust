@@ -1,0 +1,50 @@
+[
+  {
+    "name": "Tiny example",
+    "mono_items": 100,
+    "mir_bodies": 50,
+    "dataflow_functions": 20,
+    "speedup": 1.023864862892301,
+    "time_saved": 0.02330860620110111
+  },
+  {
+    "name": "Small lib",
+    "mono_items": 1000,
+    "mir_bodies": 500,
+    "dataflow_functions": 100,
+    "speedup": 1.0894278135657447,
+    "time_saved": 0.08208695652173911
+  },
+  {
+    "name": "Medium lib",
+    "mono_items": 5000,
+    "mir_bodies": 2000,
+    "dataflow_functions": 500,
+    "speedup": 1.2121911798660818,
+    "time_saved": 0.17504761904761906
+  },
+  {
+    "name": "Large lib (serde)",
+    "mono_items": 20000,
+    "mir_bodies": 8000,
+    "dataflow_functions": 2000,
+    "speedup": 1.3089005235602094,
+    "time_saved": 0.23600000000000002
+  },
+  {
+    "name": "Huge lib (rayon)",
+    "mono_items": 50000,
+    "mir_bodies": 20000,
+    "dataflow_functions": 5000,
+    "speedup": 1.3089005235602094,
+    "time_saved": 0.23600000000000002
+  },
+  {
+    "name": "Massive crate",
+    "mono_items": 100000,
+    "mir_bodies": 50000,
+    "dataflow_functions": 10000,
+    "speedup": 1.3089005235602094,
+    "time_saved": 0.23600000000000002
+  }
+]
