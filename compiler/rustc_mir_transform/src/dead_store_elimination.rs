@@ -37,6 +37,43 @@ fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> bool {
     // we don't remove assignments to them.
     let debuginfo_locals = debuginfo_locals(body);
 
+    // Try GPU-accelerated liveness first when -Z gpu-mono is enabled and function is large enough.
+    // This offloads the expensive backward dataflow fixed-point iteration to the GPU.
+    if tcx.sess.opts.unstable_opts.gpu_mono && body.basic_blocks.len() >= 50 {
+        if let Some(gpu_dead_stores) =
+            rustc_mir_dataflow::gpu_engine::GpuEngine::new(tcx, body)
+                .and_then(|engine| engine.run_backward_liveness_for_dse())
+        {
+            let mut patch = Vec::new();
+            for (bb, stmt_idx) in gpu_dead_stores {
+                let statement = &body.basic_blocks[bb].statements[stmt_idx];
+                if let Some(destination) = MaybeTransitiveLiveLocals::can_be_removed_if_dead(
+                    &statement.kind,
+                    &borrowed_locals,
+                    &debuginfo_locals,
+                ) {
+                    let loc = Location { block: bb, statement_index: stmt_idx };
+                    let drop_debuginfo = !debuginfo_locals.contains(destination.local);
+                    assert!(
+                        drop_debuginfo || statement.kind.as_debuginfo().is_some(),
+                        "don't know how to retain the debug information for {:?}",
+                        statement.kind
+                    );
+                    patch.push((loc, drop_debuginfo));
+                }
+            }
+
+            if !patch.is_empty() {
+                let bbs = body.basic_blocks.as_mut_preserves_cfg();
+                for (Location { block, statement_index }, drop_debuginfo) in patch {
+                    bbs[block].statements[statement_index].make_nop(drop_debuginfo);
+                }
+                return true;
+            }
+            // GPU found no dead stores; fall through to CPU path for call-operand promotion.
+        }
+    }
+
     let mut live = MaybeTransitiveLiveLocals::new(&borrowed_locals, &debuginfo_locals)
         .iterate_to_fixpoint(tcx, body, None)
         .into_results_cursor(body);
