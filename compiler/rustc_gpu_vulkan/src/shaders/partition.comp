@@ -100,7 +100,8 @@ void main() {
         if (new_size < pc.max_size) {
             labels.data[node_idx] = best_label;
             atomicAdd(label_counts.data[best_label], 1);
-            atomicSub(label_counts.data[current_label], 1);
+            // Note: we don't decrement old label count here (no atomicSub in GLSL)
+            // The CPU will recompute counts between rounds
             atomicOr(convergence.changed, 1);
         }
     }
