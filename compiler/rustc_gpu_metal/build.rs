@@ -78,12 +78,14 @@ fn main() {
         let air_file = out_path.join(format!("{}.air", stem));
         let metallib_file = out_path.join(format!("{}.metallib", stem));
 
-        // Compile .metal to .air
+        // Compile .metal to .air with full optimization
         let metal_output = Command::new("xcrun")
             .args([
                 "-sdk", "macosx",
                 "metal",
                 "-c",
+                "-O3",
+                "-ffast-math",
                 metal_file.to_str().unwrap(),
                 "-o",
                 air_file.to_str().unwrap(),
