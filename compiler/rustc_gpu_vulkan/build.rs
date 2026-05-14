@@ -81,4 +81,9 @@ fn main() {
         &out_dir,
         "DOMINANCE_SPV",
     );
+    compile_shader(
+        "src/shaders/loop_detect.comp",
+        &out_dir,
+        "LOOP_DETECT_SPV",
+    );
 }

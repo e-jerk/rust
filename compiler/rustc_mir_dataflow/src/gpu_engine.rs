@@ -1400,4 +1400,79 @@ impl<'tcx> GpuEngine<'tcx> {
 
         Some(result)
     }
+
+    // ------------------------------------------------------------------
+    // GPU-accelerated Loop Detection
+    // ------------------------------------------------------------------
+
+    /// Detect loops in the control flow graph on GPU.
+    ///
+    /// Returns a vector of basic blocks that are loop headers.
+    pub fn run_loop_detection(&self) -> Option<Vec<BasicBlock>> {
+        if self.body.basic_blocks.len() < 30 || self.body.basic_blocks.len() > 512 {
+            return None;
+        }
+
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_loop_detect_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let matrix_words = (num_blocks + 31) / 32;
+
+        // Serialize block info: [num_succs, succ_0, succ_1, succ_2, succ_3]
+        let mut block_info = Vec::with_capacity(num_blocks * 5);
+        for (_block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            let successors: Vec<BasicBlock> = block.terminator().successors().collect();
+            let num_succs = successors.len().min(4);
+            block_info.push(num_succs as u32);
+            for s in 0..4 {
+                if s < num_succs {
+                    block_info.push(successors[s].as_u32());
+                } else {
+                    block_info.push(0xFFFFFFFF);
+                }
+            }
+        }
+
+        // Initialize reachability matrix and loop headers
+        let reachability: Vec<u32> = vec![0; num_blocks * matrix_words];
+        let loop_headers: Vec<u32> = vec![0; matrix_words];
+
+        let block_info_buf = backend
+            .create_buffer((block_info.len() * std::mem::size_of::<u32>()) as u64)?;
+        block_info_buf.write(&block_info);
+
+        let reach_buf = backend
+            .create_buffer((reachability.len() * std::mem::size_of::<u32>()) as u64)?;
+        reach_buf.write(&reachability);
+
+        let loop_buf = backend
+            .create_buffer((loop_headers.len() * std::mem::size_of::<u32>()) as u64)?;
+        loop_buf.write(&loop_headers);
+
+        // Single-pass loop detection
+        gpu.dispatch_loop_detect_round(
+            &block_info_buf,
+            &reach_buf,
+            &loop_buf,
+            num_blocks as u32,
+            matrix_words as u32,
+        )
+        .ok()?;
+
+        // Read back loop headers
+        let loop_data: Vec<u32> = loop_buf.read(matrix_words);
+
+        let mut headers = Vec::new();
+        for block_idx in 0..num_blocks {
+            let word = block_idx / 32;
+            let bit = block_idx % 32;
+            if loop_data[word] & (1u32 << bit) != 0 {
+                headers.push(BasicBlock::from_usize(block_idx));
+            }
+        }
+
+        Some(headers)
+    }
 }

@@ -1,0 +1,135 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Loop detection via Strongly Connected Components (SCC) on GPU.
+// 
+// We use a simplified iterative approach:
+// 1. Compute reachability matrix via repeated squaring
+// 2. A node is in a loop if it can reach itself (non-trivial SCC)
+// 
+// For each block, we track which blocks it can reach.
+// Reachability[i][j] = 1 if there's a path from i to j.
+
+// Block info: [num_succs, succ_0, succ_1, succ_2, succ_3]
+layout(set = 0, binding = 0) readonly buffer BlockInfo {
+    uint data[];
+} block_info;
+
+// Reachability matrix: reach[i][j] = 1 if i can reach j
+layout(set = 0, binding = 1) buffer Reachability {
+    uint data[];
+} reachability;
+
+// Loop header output: for each block, if it's a loop header
+layout(set = 0, binding = 2) buffer LoopHeaders {
+    uint data[];
+} loop_headers;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint matrix_words;
+} pc;
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+    
+    uint info_offset = block_idx * 5;
+    uint num_succs = block_info.data[info_offset];
+    
+    // Initialize reachability with direct edges
+    uint row_start = block_idx * pc.matrix_words;
+    for (uint w = 0; w < pc.matrix_words; w++) {
+        reachability.data[row_start + w] = 0;
+    }
+    
+    // Set direct successor bits
+    for (uint s = 0; s < num_succs && s < 4; s++) {
+        uint succ = block_info.data[info_offset + 1 + s];
+        if (succ < pc.num_blocks) {
+            uint word = succ / 32;
+            uint bit = succ % 32;
+            if (word < pc.matrix_words) {
+                reachability.data[row_start + word] |= (1u << bit);
+            }
+        }
+    }
+    
+    // Iteratively compute transitive closure
+    // Each round: R_new = R_old ∪ (R_old ∘ R_old)
+    // We do a fixed number of rounds (up to num_blocks, but usually converges much faster)
+    uint max_rounds = pc.num_blocks;
+    
+    for (uint round = 0; round < max_rounds; round++) {
+        uint new_row[32];
+        for (uint w = 0; w < pc.matrix_words; w++) {
+            new_row[w] = reachability.data[row_start + w];
+        }
+        
+        // For each successor j that block_idx can reach,
+        // union j's reachable set into block_idx's
+        for (uint j = 0; j < pc.num_blocks; j++) {
+            uint j_word = j / 32;
+            uint j_bit = j % 32;
+            if (j_word < pc.matrix_words) {
+                uint bit_val = (reachability.data[row_start + j_word] >> j_bit) & 1u;
+                if (bit_val != 0u) {
+                    uint j_row_start = j * pc.matrix_words;
+                    for (uint w = 0; w < pc.matrix_words; w++) {
+                        new_row[w] |= reachability.data[j_row_start + w];
+                    }
+                }
+            }
+        }
+        
+        // Write back
+        bool changed = false;
+        for (uint w = 0; w < pc.matrix_words; w++) {
+            uint old = reachability.data[row_start + w];
+            if (old != new_row[w]) {
+                reachability.data[row_start + w] = new_row[w];
+                changed = true;
+            }
+        }
+        
+        if (!changed) {
+            break;
+        }
+    }
+    
+    // Detect loop headers:
+    // A block is a loop header if it has a predecessor that can reach it
+    // AND that predecessor is in the same SCC (i.e., can reach the block and be reached by it)
+    // Simple heuristic: block is loop header if it has >1 predecessors and
+    // at least one predecessor can reach it via a back edge
+    
+    // Check if block can reach itself (in a cycle)
+    uint self_word = block_idx / 32;
+    uint self_bit = block_idx % 32;
+    bool in_cycle = false;
+    if (self_word < pc.matrix_words) {
+        in_cycle = ((reachability.data[row_start + self_word] >> self_bit) & 1u) != 0u;
+    }
+    
+    // Mark as loop header if in cycle and has multiple predecessors
+    // (simplified heuristic)
+    if (in_cycle) {
+        uint num_preds = 0;
+        // Count predecessors by scanning all blocks' successors
+        for (uint b = 0; b < pc.num_blocks; b++) {
+            uint b_info_offset = b * 5;
+            uint b_num_succs = block_info.data[b_info_offset];
+            for (uint s = 0; s < b_num_succs && s < 4; s++) {
+                uint succ = block_info.data[b_info_offset + 1 + s];
+                if (succ == block_idx) {
+                    num_preds++;
+                }
+            }
+        }
+        
+        if (num_preds > 1) {
+            atomicOr(loop_headers.data[block_idx / 32], 1u << (block_idx % 32));
+        }
+    }
+}
