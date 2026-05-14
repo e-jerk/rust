@@ -323,6 +323,28 @@ fn merge_codegen_units<'tcx>(
     // A sorted order here ensures merging is deterministic.
     assert!(codegen_units.is_sorted_by(|a, b| a.name().as_str() <= b.name().as_str()));
 
+    let max_codegen_units = cx.tcx.sess.codegen_units().as_usize();
+
+    // Try GPU-accelerated partitioning first when enabled and beneficial.
+    // This only makes sense for non-incremental builds with many CGUs.
+    if cx.tcx.sess.opts.unstable_opts.gpu_mono
+        && cx.tcx.sess.opts.incremental.is_none()
+        && codegen_units.len() > max_codegen_units * 2
+    {
+        if let Some(gpu_result) = gpu_partition_codegen_units(cx, codegen_units, max_codegen_units) {
+            *codegen_units = gpu_result;
+            // After GPU partitioning, we may still need to merge small CGUs
+            // or ensure we're under the max count. Fall through to the
+            // small-CGU merge logic below.
+            if codegen_units.len() <= max_codegen_units {
+                // Skip the main merge loop but still do small-CGU merging
+                return merge_small_cgus(cx, codegen_units);
+            }
+        }
+        // If GPU partitioning fails or doesn't reduce enough, fall through
+        // to the greedy CPU algorithm.
+    }
+
     // This map keeps track of what got merged into what.
     let mut cgu_contents: UnordMap<Symbol, Vec<Symbol>> =
         codegen_units.iter().map(|cgu| (cgu.name(), vec![cgu.name()])).collect();
@@ -341,7 +363,6 @@ fn merge_codegen_units<'tcx>(
     // getting any bigger, if we can avoid it. When we have more than N CGUs
     // then at least one of the biggest N will have to grow. codegen_units[N-1]
     // is the smallest of those, and so has the most room to grow.
-    let max_codegen_units = cx.tcx.sess.codegen_units().as_usize();
     while codegen_units.len() > max_codegen_units {
         // Sort small CGUs to the back.
         codegen_units.sort_by_key(|cgu| cmp::Reverse(cgu.size_estimate()));
@@ -381,6 +402,17 @@ fn merge_codegen_units<'tcx>(
         cgu_contents.get_mut(&cgu_dst.name()).unwrap().append(&mut consumed_cgu_names);
     }
 
+    // Merge small CGUs and rename for both CPU and GPU paths
+    merge_small_cgus_and_rename(cx, codegen_units, &mut cgu_contents);
+}
+
+/// Merge tiny CGUs together (non-incremental builds only) and rename
+/// them deterministically. Used by both CPU and GPU partitioning paths.
+fn merge_small_cgus_and_rename<'tcx>(
+    cx: &PartitioningCx<'_, 'tcx>,
+    codegen_units: &mut Vec<CodegenUnit<'tcx>>,
+    cgu_contents: &mut UnordMap<Symbol, Vec<Symbol>>,
+) {
     // Having multiple CGUs can drastically speed up compilation. But for
     // non-incremental builds, tiny CGUs slow down compilation *and* result in
     // worse generated code. So we don't allow CGUs smaller than this (unless
@@ -391,12 +423,6 @@ fn merge_codegen_units<'tcx>(
     // Repeatedly merge the two smallest codegen units as long as: it's a
     // non-incremental build, and the user didn't specify a CGU count, and
     // there are multiple CGUs, and some are below the minimum size.
-    //
-    // The "didn't specify a CGU count" condition is because when an explicit
-    // count is requested we observe it as closely as possible. For example,
-    // the `compiler_builtins` crate sets `codegen-units = 10000` and it's
-    // critical they aren't merged. Also, some tests use explicit small values
-    // and likewise won't work if small CGUs are merged.
     while cx.tcx.sess.opts.incremental.is_none()
         && matches!(cx.tcx.sess.codegen_units(), CodegenUnits::Default(_))
         && codegen_units.len() > 1
@@ -493,6 +519,17 @@ fn merge_codegen_units<'tcx>(
             cgu.set_name(numbered_codegen_unit_name);
         }
     }
+}
+
+/// Merge small CGUs after GPU partitioning (when GPU already handled the main merge).
+fn merge_small_cgus<'tcx>(
+    cx: &PartitioningCx<'_, 'tcx>,
+    codegen_units: &mut Vec<CodegenUnit<'tcx>>,
+) {
+    // For GPU path, we don't track cgu_contents (incremental not supported with GPU)
+    let mut dummy_contents: UnordMap<Symbol, Vec<Symbol>> =
+        codegen_units.iter().map(|cgu| (cgu.name(), vec![cgu.name()])).collect();
+    merge_small_cgus_and_rename(cx, codegen_units, &mut dummy_contents);
 }
 
 /// Compute the combined size of all inlined items that appear in both `cgu1`
@@ -1362,29 +1399,148 @@ pub(crate) fn provide(providers: &mut Providers) {
 // GPU-accelerated codegen unit partitioning
 // ------------------------------------------------------------------
 
-/// Build a graph from the usage map and run GPU-accelerated label propagation
-/// to find better codegen unit partitions.
+/// Build a graph from CGU inline overlaps and run GPU-accelerated label
+/// propagation to find better codegen unit partitions.
 ///
-/// This is an experimental optimization that replaces the greedy merge algorithm
-/// with a GPU graph partitioning approach for crates with many codegen units.
+/// This replaces the greedy merge algorithm with a GPU graph partitioning
+/// approach for non-incremental builds with many CGUs.
 #[allow(dead_code)]
 fn gpu_partition_codegen_units<'tcx>(
-    _cx: &PartitioningCx<'_, 'tcx>,
-    _mono_items: &[MonoItem<'tcx>],
-    _usage_map: &UsageMap<'tcx>,
-    _max_cgus: usize,
+    cx: &PartitioningCx<'_, 'tcx>,
+    codegen_units: &mut Vec<CodegenUnit<'tcx>>,
+    max_cgus: usize,
 ) -> Option<Vec<CodegenUnit<'tcx>>> {
-    // This is a placeholder for the full GPU partitioning implementation.
-    // The algorithm would:
-    // 1. Build an adjacency list from the usage map
-    // 2. Serialize it to GPU buffers
-    // 3. Run label propagation on GPU
-    // 4. Read back partition assignments
-    // 5. Build CodegenUnits from the assignments
-    //
-    // Currently disabled because:
-    // - The existing source-based partitioning is better for incremental builds
-    // - GPU partitioning only makes sense for non-incremental builds with many CGUs
-    // - Integration requires significant changes to the partitioning pipeline
-    None
+    // Only run when GPU is available and we have enough CGUs to benefit
+    if codegen_units.len() <= max_cgus {
+        return None; // No merging needed
+    }
+
+    // Build GPU backend
+    let backend = rustc_gpu_vulkan::GpuBackend::new()?;
+
+    // Load partition shader
+    let shader_spv = rustc_gpu_vulkan::load_partition_shader()?;
+    let pipeline = rustc_gpu_vulkan::shader::ComputePipeline::from_spirv(
+        &backend.context.device,
+        &shader_spv,
+    ).ok()?;
+
+    // Build adjacency list from CGU inline overlaps
+    let num_nodes = codegen_units.len();
+    let mut edge_list = Vec::new();
+    let mut edge_offsets = vec![0u32; num_nodes + 1];
+
+    for (i, cgu_i) in codegen_units.iter().enumerate() {
+        let start = edge_list.len() as u32;
+        edge_offsets[i] = start;
+
+        for (j, cgu_j) in codegen_units.iter().enumerate() {
+            if i == j { continue; }
+            let overlap = compute_inlined_overlap(cgu_i, cgu_j);
+            if overlap > 0 {
+                // Store neighbor index and weight (packed: weight in upper 16 bits)
+                let weight = (overlap.min(65535) as u32) << 16;
+                edge_list.push((j as u32) | weight);
+            }
+        }
+    }
+    edge_offsets[num_nodes] = edge_list.len() as u32;
+
+    // Allocate GPU buffers
+    let edge_list_buf = backend.create_buffer(
+        (edge_list.len() * std::mem::size_of::<u32>()) as u64
+    )?;
+    let edge_offsets_buf = backend.create_buffer(
+        (edge_offsets.len() * std::mem::size_of::<u32>()) as u64
+    )?;
+    let labels_buf = backend.create_buffer(
+        (num_nodes * std::mem::size_of::<u32>()) as u64
+    )?;
+    let label_counts_buf = backend.create_buffer(
+        (num_nodes * std::mem::size_of::<u32>()) as u64
+    )?;
+    let convergence_buf = backend.create_buffer(4)?;
+
+    // Initialize labels: each node starts with its own label
+    let labels: Vec<u32> = (0..num_nodes as u32).collect();
+    let label_counts: Vec<u32> = vec![1; num_nodes];
+    edge_list_buf.write(&edge_list);
+    edge_offsets_buf.write(&edge_offsets);
+    labels_buf.write(&labels);
+    label_counts_buf.write(&label_counts);
+    convergence_buf.write(&[0u32]);
+
+    // Create dispatch engine
+    let dispatch = rustc_gpu_vulkan::dispatch::GpuDispatch::new(&backend.context).ok()?;
+
+    // Run label propagation for a fixed number of rounds
+    const MAX_ROUNDS: u32 = 50;
+    let target_size = (codegen_units.iter().map(|c| c.size_estimate()).sum::<usize>() / max_cgus) as u32;
+
+    for _round in 0..MAX_ROUNDS {
+        // Clear convergence flag
+        convergence_buf.write(&[0u32]);
+
+        // Dispatch partition kernel
+        dispatch.dispatch(
+            &pipeline,
+            &edge_list_buf,
+            &edge_offsets_buf,
+            &labels_buf,
+            num_nodes as u32,
+        ).ok()?;
+
+        // Check convergence
+        let conv: Vec<u32> = convergence_buf.read(1);
+        if conv[0] == 0 {
+            break; // Converged
+        }
+    }
+
+    // Read back labels
+    let final_labels: Vec<u32> = labels_buf.read(num_nodes);
+
+    // Group CGUs by label and merge
+    let mut label_to_cgus: FxIndexMap<u32, Vec<usize>> = FxIndexMap::default();
+    for (idx, label) in final_labels.iter().enumerate() {
+        label_to_cgus.entry(*label).or_default().push(idx);
+    }
+
+    // Build merged CGUs
+    let mut merged_cgus: Vec<CodegenUnit<'tcx>> = Vec::new();
+    let cgu_name_builder = &mut CodegenUnitNameBuilder::new(cx.tcx);
+
+    for (_label, indices) in label_to_cgus {
+        if indices.is_empty() { continue; }
+
+        // Start with the first CGU
+        let mut merged = codegen_units[indices[0]].clone();
+
+        // Merge remaining CGUs into it
+        for &idx in indices.iter().skip(1) {
+            let src = &codegen_units[idx];
+            merged.items_mut().append(src.items_mut());
+        }
+        merged.compute_size_estimate();
+
+        // Generate deterministic name
+        let suffix = format!("gpu_{}", merged_cgus.len());
+        let new_name = cgu_name_builder.build_cgu_name_no_mangle(LOCAL_CRATE, &["cgu"], Some(suffix));
+        merged.set_name(new_name);
+
+        merged_cgus.push(merged);
+    }
+
+    // If we still have too many CGUs, fall back to greedy merge
+    if merged_cgus.len() > max_cgus {
+        merge_codegen_units(cx, &mut merged_cgus);
+    }
+
+    // Ensure sorted by name for determinism
+    merged_cgus.sort_by(|a, b| a.name().as_str().cmp(b.name().as_str()));
+
+    eprintln!("[GPU-PARTITION] Reduced {} CGUs to {} via label propagation",
+        num_nodes, merged_cgus.len());
+
+    Some(merged_cgus)
 }
