@@ -14,7 +14,7 @@ rustc_macros = { path = "../rustc_macros" }
 rustc_middle = { path = "../rustc_middle" }
 rustc_session = { path = "../rustc_session" }
 rustc_span = { path = "../rustc_span" }
-rustc_gpu_vulkan = { path = "../rustc_gpu_vulkan", optional = true }
+rustc_gpu_vulkan = { path = "../rustc_gpu_vulkan" }
 rustc_target = { path = "../rustc_target" }
 serde = "1"
 serde_json = "1"

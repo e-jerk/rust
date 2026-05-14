@@ -207,7 +207,6 @@ pub fn resolve_edge<'tcx>(
     Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), def_id, *args).ok().flatten()
 }
 
-#[cfg(feature = "rustc_gpu_vulkan")]
 pub fn gpu_collect_mono_items<'tcx>(
     tcx: TyCtxt<'tcx>,
     roots: Vec<MonoItem<'tcx>>,
@@ -298,10 +297,4 @@ pub fn gpu_collect_mono_items<'tcx>(
     Some((mono_items, usage_map))
 }
 
-#[cfg(not(feature = "rustc_gpu_vulkan"))]
-pub fn gpu_collect_mono_items<'tcx>(
-    _tcx: TyCtxt<'tcx>,
-    _roots: Vec<MonoItem<'tcx>>,
-) -> Option<(Vec<MonoItem<'tcx>>, UsageMap<'tcx>)> {
-    None
-}
+

@@ -1821,11 +1821,10 @@ pub(crate) fn collect_crate_mono_items<'tcx>(
         .time("monomorphization_collector_root_collections", || collect_roots(tcx, strategy));
 
     if tcx.sess.opts.unstable_opts.gpu_mono {
-        #[cfg(feature = "rustc_gpu_vulkan")]
-        if let Some(result) = gpu_collector::gpu_collect_mono_items(tcx, roots.clone()) {
+        if let Some(result) = crate::gpu_collector::gpu_collect_mono_items(tcx, roots.clone()) {
             return result;
         }
-        // If GPU path fails or feature not enabled, fall through to CPU path
+        // If GPU path fails, fall through to CPU path
     }
 
     debug!("building mono item graph, beginning at roots");
