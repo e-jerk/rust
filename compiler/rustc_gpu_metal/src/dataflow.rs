@@ -40,6 +40,49 @@ impl MetalDataflowEngine {
         })
     }
     
+    /// Dispatch a batch of dataflow rounds in a single command buffer.
+    ///
+    /// Each tuple is (config, effects, entry, exit, convergence, num_blocks, bitset_words, effects_stride).
+    /// All dispatches share the same pipeline and are encoded back-to-back.
+    /// Amortizes command buffer creation + commit + wait overhead.
+    pub fn dispatch_round_batch(
+        &self,
+        dispatches: &[(
+            &MetalBuffer, &MetalBuffer, &MetalBuffer, &MetalBuffer, &MetalBuffer,
+            u32, u32, u32,
+        )],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cmd_buf = self.queue.new_command_buffer();
+        for (config_buf, effects_buf, entry_buf, exit_buf, convergence_buf,
+             num_blocks, bitset_words, effects_stride) in dispatches {
+            let encoder = cmd_buf.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.pipeline);
+            encoder.set_buffer(0, Some(&config_buf.buffer), 0);
+            encoder.set_buffer(1, Some(&effects_buf.buffer), 0);
+            encoder.set_buffer(2, Some(&entry_buf.buffer), 0);
+            encoder.set_buffer(3, Some(&exit_buf.buffer), 0);
+            encoder.set_buffer(4, Some(&convergence_buf.buffer), 0);
+            let push_constants = [*num_blocks, *bitset_words, *effects_stride];
+            encoder.set_bytes(
+                5,
+                std::mem::size_of_val(&push_constants) as u64,
+                &push_constants as *const _ as *const c_void,
+            );
+            let threadgroup_size = metal::MTLSize::new(128, 1, 1);
+            if *num_blocks % 128 == 0 {
+                let threadgroups = metal::MTLSize::new((*num_blocks / 128) as u64, 1, 1);
+                encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+            } else {
+                let grid_size = metal::MTLSize::new(*num_blocks as u64, 1, 1);
+                encoder.dispatch_threads(grid_size, threadgroup_size);
+            }
+            encoder.end_encoding();
+        }
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+        Ok(())
+    }
+
     /// Dispatch one dataflow round.
     pub fn dispatch_round(
         &self,
@@ -70,9 +113,14 @@ impl MetalDataflowEngine {
             &push_constants as *const _ as *const c_void,
         );
         
-        let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
         let threadgroup_size = metal::MTLSize::new(256, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
+        if num_blocks % 256 == 0 {
+            let threadgroups = metal::MTLSize::new((num_blocks / 256) as u64, 1, 1);
+            encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        } else {
+            let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+        }
         
         encoder.end_encoding();
         cmd_buf.commit();
@@ -112,11 +160,75 @@ impl MetalDataflowEngine {
             &push_constants as *const _ as *const c_void,
         );
         
-        let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
+        // Use dispatchThreadgroups when grid aligns to threadgroup for lower driver overhead
         let threadgroup_size = metal::MTLSize::new(128, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
+        if num_blocks % 128 == 0 {
+            let threadgroups = metal::MTLSize::new((num_blocks / 128) as u64, 1, 1);
+            encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        } else {
+            let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+        }
         
         encoder.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+        
+        Ok(())
+    }
+    
+    /// Dispatch fused MIR optimization batch: N dispatches in 1 command buffer.
+    ///
+    /// Amortizes command buffer creation + commit + wait overhead across N dispatches.
+    /// Useful for independent work items (e.g., monomorphization batches, multiple
+    /// functions in a crate) where CPU synchronization is not needed between dispatches.
+    pub fn dispatch_fused_mir_opt_batch(
+        &self,
+        dispatches: &[(
+            &MetalBuffer, // config
+            &MetalBuffer, // effects
+            &MetalBuffer, // entry
+            &MetalBuffer, // exit
+            &MetalBuffer, // convergence
+            u32, // num_blocks
+            u32, // num_locals
+            u32, // bitset_words
+            u32, // effects_stride
+        )],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cmd_buf = self.queue.new_command_buffer();
+        
+        for (config_buf, effects_buf, entry_buf, exit_buf, convergence_buf,
+             num_blocks, num_locals, bitset_words, effects_stride) in dispatches {
+            let encoder = cmd_buf.new_compute_command_encoder();
+            
+            encoder.set_compute_pipeline_state(&self.pipeline);
+            
+            encoder.set_buffer(0, Some(&config_buf.buffer), 0);
+            encoder.set_buffer(1, Some(&effects_buf.buffer), 0);
+            encoder.set_buffer(2, Some(&entry_buf.buffer), 0);
+            encoder.set_buffer(3, Some(&exit_buf.buffer), 0);
+            encoder.set_buffer(4, Some(&convergence_buf.buffer), 0);
+            
+            let push_constants = [*num_blocks, *num_locals, *bitset_words, *effects_stride];
+            encoder.set_bytes(
+                5,
+                std::mem::size_of_val(&push_constants) as u64,
+                &push_constants as *const _ as *const c_void,
+            );
+            
+            let threadgroup_size = metal::MTLSize::new(128, 1, 1);
+            if *num_blocks % 128 == 0 {
+                let threadgroups = metal::MTLSize::new((*num_blocks / 128) as u64, 1, 1);
+                encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+            } else {
+                let grid_size = metal::MTLSize::new(*num_blocks as u64, 1, 1);
+                encoder.dispatch_threads(grid_size, threadgroup_size);
+            }
+            
+            encoder.end_encoding();
+        }
+        
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
         
@@ -146,9 +258,14 @@ impl MetalDataflowEngine {
             &push_constants as *const _ as *const c_void,
         );
         
-        let grid_size = metal::MTLSize::new(num_accesses as u64, 1, 1);
         let threadgroup_size = metal::MTLSize::new(64, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
+        if num_accesses % 64 == 0 {
+            let threadgroups = metal::MTLSize::new((num_accesses / 64) as u64, 1, 1);
+            encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        } else {
+            let grid_size = metal::MTLSize::new(num_accesses as u64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+        }
         
         encoder.end_encoding();
         cmd_buf.commit();
@@ -182,9 +299,14 @@ impl MetalDataflowEngine {
             &push_constants as *const _ as *const c_void,
         );
         
-        let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
         let threadgroup_size = metal::MTLSize::new(64, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
+        if num_blocks % 64 == 0 {
+            let threadgroups = metal::MTLSize::new((num_blocks / 64) as u64, 1, 1);
+            encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        } else {
+            let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+        }
         
         encoder.end_encoding();
         cmd_buf.commit();
@@ -218,9 +340,14 @@ impl MetalDataflowEngine {
             &push_constants as *const _ as *const c_void,
         );
         
-        let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
         let threadgroup_size = metal::MTLSize::new(64, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
+        if num_blocks % 64 == 0 {
+            let threadgroups = metal::MTLSize::new((num_blocks / 64) as u64, 1, 1);
+            encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        } else {
+            let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+        }
         
         encoder.end_encoding();
         cmd_buf.commit();
@@ -255,9 +382,14 @@ impl MetalDataflowEngine {
             &push_constants as *const _ as *const c_void,
         );
         
-        let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
         let threadgroup_size = metal::MTLSize::new(64, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
+        if num_blocks % 64 == 0 {
+            let threadgroups = metal::MTLSize::new((num_blocks / 64) as u64, 1, 1);
+            encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        } else {
+            let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+        }
         
         encoder.end_encoding();
         cmd_buf.commit();
@@ -290,9 +422,14 @@ impl MetalDataflowEngine {
             &push_constants as *const _ as *const c_void,
         );
         
-        let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
         let threadgroup_size = metal::MTLSize::new(64, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
+        if num_blocks % 64 == 0 {
+            let threadgroups = metal::MTLSize::new((num_blocks / 64) as u64, 1, 1);
+            encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        } else {
+            let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+        }
         
         encoder.end_encoding();
         cmd_buf.commit();
@@ -334,9 +471,14 @@ impl MetalDataflowEngine {
         );
         
         let total_blocks = num_functions * blocks_per_workgroup;
-        let grid_size = metal::MTLSize::new(total_blocks as u64, 1, 1);
         let threadgroup_size = metal::MTLSize::new(256, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
+        if total_blocks % 256 == 0 {
+            let threadgroups = metal::MTLSize::new((total_blocks / 256) as u64, 1, 1);
+            encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        } else {
+            let grid_size = metal::MTLSize::new(total_blocks as u64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+        }
         
         encoder.end_encoding();
         cmd_buf.commit();
@@ -375,9 +517,14 @@ impl MetalDataflowEngine {
             &push_constants as *const _ as *const c_void,
         );
         
-        let grid_size = metal::MTLSize::new(num_nodes as u64, 1, 1);
         let threadgroup_size = metal::MTLSize::new(256, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
+        if num_nodes % 256 == 0 {
+            let threadgroups = metal::MTLSize::new((num_nodes / 256) as u64, 1, 1);
+            encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        } else {
+            let grid_size = metal::MTLSize::new(num_nodes as u64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+        }
         
         encoder.end_encoding();
         cmd_buf.commit();
@@ -414,9 +561,14 @@ impl MetalDataflowEngine {
             &push_constants as *const _ as *const c_void,
         );
         
-        let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
         let threadgroup_size = metal::MTLSize::new(64, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
+        if num_blocks % 64 == 0 {
+            let threadgroups = metal::MTLSize::new((num_blocks / 64) as u64, 1, 1);
+            encoder.dispatch_thread_groups(threadgroups, threadgroup_size);
+        } else {
+            let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+        }
         
         encoder.end_encoding();
         cmd_buf.commit();
