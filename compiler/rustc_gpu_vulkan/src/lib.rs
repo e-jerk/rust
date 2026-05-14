@@ -161,6 +161,15 @@ pub fn load_partition_shader() -> Option<Vec<u8>> {
     }
 }
 
+/// Load the fused MIR optimization shader (4 analyses in 1 dispatch).
+pub fn load_fused_mir_opt_shader() -> Option<Vec<u8>> {
+    if let Ok(spv_path) = std::env::var("FUSED_MIR_OPT_SPV") {
+        std::fs::read(spv_path).ok()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

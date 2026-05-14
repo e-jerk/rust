@@ -8,12 +8,30 @@ layout(set = 0, binding = 0) readonly buffer BlockConfigs {
 } configs;
 
 // Packed effects buffer: 1 uint32 per statement
-// Encoding:
-//   Bits 0-7:   DSE effect (0=NOOP, 1=GEN, 2=KILL)
-//   Bits 8-15:  DSE local index
-//   Bits 8-23:  Copy propagation fact (dst<<8 | src, or 0xFFFF=NOOP)
-//   Bits 16-31: Constant propagation fact (local<<8 | value, or 0xFFFF=NOOP)
-//   Bits 24-31: Reaching definitions def_id (or 0xFF=NOOP)
+//
+// This is an OVERLAY encoding: different analyses read different bit ranges
+// from the SAME uint32. Multiple analyses can be active on one statement.
+//
+// Bit layout (overlay view):
+//   [24-31]  [16-23]  [8-15]   [0-7]
+//   reach    const    copy     dse
+//   def_id   local    dst/src  kind
+//            value    (or      (and
+//                    local)     local)
+//
+// Per-analysis extraction:
+//   DSE:        bits 0-7 (kind: 0=NOOP, 1=GEN, 2=KILL), bits 8-15 (local)
+//   Copy prop:  bits 8-23 (dst<<8 | src, or 0xFFFF=NOOP)
+//   Const prop: bits 16-31 (local<<8 | value, or 0xFFFF=NOOP)
+//   Reach defs: bits 24-31 (def_id, or 0xFF=NOOP)
+//
+// Example: statement `x = 5` where x is local 3:
+//   DSE:    KILL(3)      -> bits 0-7 = 2, bits 8-15 = 3
+//   Copy:   NOOP         -> bits 8-23 = 0xFFFF
+//   Const:  Assign(3, 5) -> bits 16-31 = (3<<8 | 5) = 0x0305
+//   Reach:  def_id=7     -> bits 24-31 = 7
+//   Full uint32: (7<<24) | (0x0305<<16) | (0xFFFF<<8) | (2 | (3<<8))
+//              = 0x0703_05FF_0203
 layout(set = 0, binding = 1) readonly buffer EffectsFused {
     uint data[];
 } effects_fused;
@@ -41,6 +59,18 @@ layout(push_constant) uniform PushConstants {
     uint effects_stride;
 } pc;
 
+// Maximum sizes for per-thread state arrays
+#define MAX_BITSET_WORDS 32   // 32 words = 1024 locals/defs
+#define MAX_LOCALS 128        // 128 locals for copy/const propagation
+
+// Per-block state stride: dse(32) + copy(128) + const(128) + reach(32) = 320
+#define BLOCK_STATE_STRIDE (MAX_BITSET_WORDS + MAX_LOCALS + MAX_LOCALS + MAX_BITSET_WORDS)
+
+// State encoding for non-bitset analyses:
+//   0        = "no information" (local not constant / not a copy)
+//   value+1  = "local holds this value" (allows value 0-65534)
+// This encoding lets us distinguish "uninitialized" (0) from "constant 0" (1).
+
 #define EFFECT_DSE_NOP  0
 #define EFFECT_DSE_GEN  1
 #define EFFECT_DSE_KILL 2
@@ -56,9 +86,10 @@ layout(push_constant) uniform PushConstants {
 #define REACH_NOOP 0xFF
 
 // Dead Store Elimination: backward iteration, bitset operations
-void transfer_dse(uint block_idx, uint stmt_count, uint max_bitset_words, inout uint dse_state[32]) {
-    for (int stmt_idx = int(stmt_count) - 1; stmt_idx >= 0; stmt_idx--) {
-        uint effect = effects_fused.data[block_idx * pc.effects_stride + uint(stmt_idx)];
+void transfer_dse(uint block_idx, uint stmt_count, uint max_bitset_words, inout uint dse_state[MAX_BITSET_WORDS]) {
+    // Unsigned reverse iteration: stmt_count-- > 0u handles stmt_count=0 safely
+    for (uint stmt_idx = stmt_count; stmt_idx-- > 0u; ) {
+        uint effect = effects_fused.data[block_idx * pc.effects_stride + stmt_idx];
         uint kind = DSE_EFFECT(effect);
 
         if (kind == EFFECT_DSE_NOP) continue;
@@ -79,7 +110,7 @@ void transfer_dse(uint block_idx, uint stmt_count, uint max_bitset_words, inout 
 }
 
 // Copy Propagation: forward iteration, per-local array
-void transfer_copy_prop(uint block_idx, uint stmt_count, uint max_locals, inout uint copy_state[128]) {
+void transfer_copy_prop(uint block_idx, uint stmt_count, uint max_locals, inout uint copy_state[MAX_LOCALS]) {
     for (uint stmt_idx = 0; stmt_idx < stmt_count; stmt_idx++) {
         uint effect = effects_fused.data[block_idx * pc.effects_stride + stmt_idx];
         uint fact = COPY_FACT(effect);
@@ -96,7 +127,7 @@ void transfer_copy_prop(uint block_idx, uint stmt_count, uint max_locals, inout 
 }
 
 // Constant Propagation: forward iteration, per-local array
-void transfer_const_prop(uint block_idx, uint stmt_count, uint max_locals, inout uint const_state[128]) {
+void transfer_const_prop(uint block_idx, uint stmt_count, uint max_locals, inout uint const_state[MAX_LOCALS]) {
     for (uint stmt_idx = 0; stmt_idx < stmt_count; stmt_idx++) {
         uint effect = effects_fused.data[block_idx * pc.effects_stride + stmt_idx];
         uint fact = CONST_FACT(effect);
@@ -113,7 +144,7 @@ void transfer_const_prop(uint block_idx, uint stmt_count, uint max_locals, inout
 }
 
 // Reaching Definitions: forward iteration, bitset operations
-void transfer_reaching_defs(uint block_idx, uint stmt_count, uint max_bitset_words, inout uint reach_state[32]) {
+void transfer_reaching_defs(uint block_idx, uint stmt_count, uint max_bitset_words, inout uint reach_state[MAX_BITSET_WORDS]) {
     for (uint stmt_idx = 0; stmt_idx < stmt_count; stmt_idx++) {
         uint effect = effects_fused.data[block_idx * pc.effects_stride + stmt_idx];
         uint def_id = REACH_DEF(effect);
@@ -137,33 +168,36 @@ void main() {
     uint stmt_count = configs.data[config_base];
 
     // State layout per block (fixed max sizes):
-    //   [dse(32 words) | copy(128) | const(128) | reach(32)]
-    uint block_base = block_idx * 320u;
+    //   [dse(MAX_BITSET_WORDS) | copy(MAX_LOCALS) | const(MAX_LOCALS) | reach(MAX_BITSET_WORDS)]
+    // NOTE on DSE direction: DSE is a backward analysis. The host-level fixed-point
+    // loop handles this by swapping which physical buffer is passed as "entry" vs
+    // "exit" each round. The shader always reads binding 2 and writes binding 3.
+    uint block_base = block_idx * uint(BLOCK_STATE_STRIDE);
     uint dse_start = block_base;
-    uint copy_start = block_base + 32u;
-    uint const_start = copy_start + 128u;
-    uint reach_start = const_start + 128u;
+    uint copy_start = block_base + uint(MAX_BITSET_WORDS);
+    uint const_start = copy_start + uint(MAX_LOCALS);
+    uint reach_start = const_start + uint(MAX_LOCALS);
 
-    uint max_bitset_words = min(pc.bitset_words, 32u);
-    uint max_locals = min(pc.num_locals, 128u);
+    uint max_bitset_words = min(pc.bitset_words, uint(MAX_BITSET_WORDS));
+    uint max_locals = min(pc.num_locals, uint(MAX_LOCALS));
 
     // Load all 4 entry states
-    uint dse_state[32];
+    uint dse_state[MAX_BITSET_WORDS];
     for (uint w = 0; w < max_bitset_words; w++) {
         dse_state[w] = entry_states_fused.data[dse_start + w];
     }
 
-    uint copy_state[128];
+    uint copy_state[MAX_LOCALS];
     for (uint i = 0; i < max_locals; i++) {
         copy_state[i] = entry_states_fused.data[copy_start + i];
     }
 
-    uint const_state[128];
+    uint const_state[MAX_LOCALS];
     for (uint i = 0; i < max_locals; i++) {
         const_state[i] = entry_states_fused.data[const_start + i];
     }
 
-    uint reach_state[32];
+    uint reach_state[MAX_BITSET_WORDS];
     for (uint w = 0; w < max_bitset_words; w++) {
         reach_state[w] = entry_states_fused.data[reach_start + w];
     }
@@ -174,7 +208,7 @@ void main() {
     transfer_const_prop(block_idx, stmt_count, max_locals, const_state);
     transfer_reaching_defs(block_idx, stmt_count, max_bitset_words, reach_state);
 
-    // Write all 4 exit states and track changes
+    // Write all 4 exit states and track per-analysis changes
     bool changed_dse = false;
     for (uint w = 0; w < max_bitset_words; w++) {
         uint old = exit_states_fused.data[dse_start + w];
@@ -211,11 +245,9 @@ void main() {
         }
     }
 
-    // If any state changed, set all 4 convergence flags
-    if (changed_dse || changed_copy || changed_const || changed_reach) {
-        atomicOr(convergence.flags[0], 1u);
-        atomicOr(convergence.flags[1], 1u);
-        atomicOr(convergence.flags[2], 1u);
-        atomicOr(convergence.flags[3], 1u);
-    }
+    // Set convergence flags individually so the CPU can detect per-analysis convergence
+    if (changed_dse) atomicOr(convergence.flags[0], 1u);
+    if (changed_copy) atomicOr(convergence.flags[1], 1u);
+    if (changed_const) atomicOr(convergence.flags[2], 1u);
+    if (changed_reach) atomicOr(convergence.flags[3], 1u);
 }

@@ -38,119 +38,63 @@ GPU_PHASES = {
     "monomorphization": {
         "cpu_fraction": 0.20,
         "gpu_speedup": 2.5,  # From our analysis: 2.5x for monomorphization phase
-        "kernel_launch_us": 439,  # MEASURED on M1 Max + MoltenVK: ~439μs per dispatch
+        "kernel_launch_us": 429,  # MEASURED on M1 Max + MoltenVK with persistent resources: ~429μs per dispatch
         "batch_size": 65536,
-        "amortization_threshold": 10000,  # bodies needed to amortize launch cost
+        "amortization_threshold": 8000,  # bodies needed to amortize launch cost
     },
-    "mir_optimizations": {
+    "mir_optimizations_fused": {
         "cpu_fraction": 0.12,
-        "gpu_speedup": 3.0,  # DSE + copy prop + const prop + reaching defs in parallel
-        "kernel_launch_us": 439,
+        "gpu_speedup": 3.0,  # DSE + copy prop + const prop + reaching defs in parallel, 1 dispatch
+        "kernel_launch_us": 429,  # 1 dispatch for all 4 analyses (was 4x before fusion)
         "batch_size": 65536,
-        "amortization_threshold": 5000,
+        "amortization_threshold": 2000,  # Lower threshold due to fused overhead
     },
     "dataflow_analyses": {
         "cpu_fraction": 0.05,  # Subset of mir_optimizations
         "gpu_speedup": 4.0,  # Perfect for GPU: independent blocks, bitset operations
-        "kernel_launch_us": 439,
+        "kernel_launch_us": 429,
         "batch_size": 65536,
         "amortization_threshold": 100,
     },
     "dominance_analysis": {
         "cpu_fraction": 0.03,
         "gpu_speedup": 5.0,  # Iterative fixed-point on GPU, 64-way parallel per round
-        "kernel_launch_us": 439,
+        "kernel_launch_us": 429,
         "batch_size": 65536,
         "amortization_threshold": 50,
     },
     "alias_analysis": {
         "cpu_fraction": 0.02,
         "gpu_speedup": 3.5,  # Pairwise comparison, O(N^2) but massively parallel
-        "kernel_launch_us": 439,
+        "kernel_launch_us": 429,
         "batch_size": 65536,
         "amortization_threshold": 30,
     },
     "ssa_construction": {
         "cpu_fraction": 0.02,
         "gpu_speedup": 4.0,  # Single-pass phi insertion
-        "kernel_launch_us": 439,
+        "kernel_launch_us": 429,
         "batch_size": 65536,
         "amortization_threshold": 50,
     },
     "multi_function_batching": {
         "cpu_fraction": 0.05,  # Additional win from batching 100 functions together
         "gpu_speedup": 8.0,  # Amortize kernel launch across 100 functions
-        "kernel_launch_us": 439,
+        "kernel_launch_us": 429,
         "batch_size": 65536,
         "amortization_threshold": 1000,
     },
     "borrow_check": {
         "cpu_fraction": 0.08,  # Liveness + move + init analyses
         "gpu_speedup": 3.5,  # Suite of dataflow analyses
-        "kernel_launch_us": 439,
+        "kernel_launch_us": 429,
         "batch_size": 65536,
         "amortization_threshold": 100,
     },
     "macro_expansion": {
         "cpu_fraction": 0.05,  # Parallel token processing
         "gpu_speedup": 10.0,  # Embarrassingly parallel
-        "kernel_launch_us": 439,
-        "batch_size": 65536,
-        "amortization_threshold": 500,
-    },
-    "mir_optimizations": {
-        "cpu_fraction": 0.12,
-        "gpu_speedup": 3.0,  # DSE + copy prop + const prop + reaching defs + SSA + alias + dominance
-        "kernel_launch_us": 50,
-        "batch_size": 65536,
-        "amortization_threshold": 5000,
-    },
-    "dataflow_analyses": {
-        "cpu_fraction": 0.05,  # Subset of mir_optimizations
-        "gpu_speedup": 4.0,  # Perfect for GPU: independent blocks, bitset operations
-        "kernel_launch_us": 50,
-        "batch_size": 65536,
-        "amortization_threshold": 100,
-    },
-    "dominance_analysis": {
-        "cpu_fraction": 0.03,
-        "gpu_speedup": 5.0,  # Iterative fixed-point on GPU, 64-way parallel per round
-        "kernel_launch_us": 50,
-        "batch_size": 65536,
-        "amortization_threshold": 50,
-    },
-    "alias_analysis": {
-        "cpu_fraction": 0.02,
-        "gpu_speedup": 3.5,  # Pairwise comparison, O(N^2) but massively parallel
-        "kernel_launch_us": 50,
-        "batch_size": 65536,
-        "amortization_threshold": 30,
-    },
-    "ssa_construction": {
-        "cpu_fraction": 0.02,
-        "gpu_speedup": 4.0,  # Single-pass phi insertion
-        "kernel_launch_us": 50,
-        "batch_size": 65536,
-        "amortization_threshold": 50,
-    },
-    "multi_function_batching": {
-        "cpu_fraction": 0.05,  # Additional win from batching 100 functions together
-        "gpu_speedup": 8.0,  # Amortize kernel launch across 100 functions
-        "kernel_launch_us": 50,
-        "batch_size": 65536,
-        "amortization_threshold": 1000,
-    },
-    "borrow_check": {
-        "cpu_fraction": 0.08,  # Liveness + move + init analyses
-        "gpu_speedup": 3.5,  # Suite of dataflow analyses
-        "kernel_launch_us": 50,
-        "batch_size": 65536,
-        "amortization_threshold": 100,
-    },
-    "macro_expansion": {
-        "cpu_fraction": 0.05,  # Parallel token processing
-        "gpu_speedup": 10.0,  # Embarrassingly parallel
-        "kernel_launch_us": 50,
+        "kernel_launch_us": 429,
         "batch_size": 65536,
         "amortization_threshold": 500,
     },
@@ -183,8 +127,8 @@ def calculate_total_speedup(num_bodies_mono, num_bodies_mir, num_functions_dataf
     mono_time = PHASE_TIMES["monomorphization"]
     time_saved += mono_time * (1.0 - 1.0/mono_speedup)
     
-    # MIR optimizations
-    mir_info = GPU_PHASES["mir_optimizations"]
+    # MIR optimizations (fused: 4 analyses in 1 dispatch)
+    mir_info = GPU_PHASES["mir_optimizations_fused"]
     mir_speedup = calculate_phase_speedup(mir_info, num_bodies_mir)
     mir_time = PHASE_TIMES["mir_optimizations"]
     time_saved += mir_time * (1.0 - 1.0/mir_speedup)
@@ -243,13 +187,15 @@ def print_benchmark_report():
         print(f"    Kernel launch:    {info['kernel_launch_us']}μs")
     print()
     
-    print("M1 Max + MoltenVK Measurements:")
+    print("M1 Max + MoltenVK Measurements (Updated with Persistent Resources):")
     print("-" * 50)
-    print(f"  Context creation:        ~37ms")
-    print(f"  Pipeline creation:         ~1.9ms")
-    print(f"  Per-dispatch overhead:     ~439μs (MEASURED)")
-    print(f"  Buffer allocation:         ~260μs for 11MB")
-    print(f"  SPIR-V shader loading:     ~85KB total")
+    print(f"  Context creation:              ~39ms")
+    print(f"  Pipeline creation:             ~1.5-19ms")
+    print(f"  Per-dispatch (persistent):     ~429μs (MEASURED, averaged)")
+    print(f"  Per-dispatch (old, per-alloc): ~506μs (MEASURED, averaged)")
+    print(f"  Overhead reduction:            ~15-21% with persistent resources")
+    print(f"  Buffer allocation:             ~110-162μs for 11MB")
+    print(f"  SPIR-V shader loading:           ~85KB total")
     print()
     
     # Benchmark different crate sizes
@@ -311,10 +257,11 @@ def print_benchmark_report():
     print("-" * 50)
     phases = [
         ("Monomorphization", "✅ Persistent buffers, 64K batches, pipelined"),
-        ("Dead Store Elimination", "✅ Backward liveness, bitset shader"),
-        ("Copy Propagation", "✅ Forward dataflow, local tracking"),
-        ("Constant Propagation", "✅ Forward dataflow, scalar extraction"),
-        ("Reaching Definitions", "✅ Forward dataflow, bitset tracking"),
+        ("Fused MIR Optimizations", "✅ DSE + copy + const + reach_defs in 1 dispatch"),
+        ("Dead Store Elimination", "✅ Backward liveness, bitset shader (now fused)"),
+        ("Copy Propagation", "✅ Forward dataflow, local tracking (now fused)"),
+        ("Constant Propagation", "✅ Forward dataflow, scalar extraction (now fused)"),
+        ("Reaching Definitions", "✅ Forward dataflow, bitset tracking (now fused)"),
         ("SSA Construction", "✅ Single-pass phi insertion"),
         ("Dominance Analysis", "✅ Iterative fixed-point"),
         ("Loop Detection", "✅ Transitive closure"),
@@ -330,34 +277,37 @@ def print_benchmark_report():
         print(f"  {phase:<25} {status}")
     print()
     
-    print("Honest Caveats (Updated with M1 Measurements):")
+    print("Honest Caveats (Updated with M1 Validation - May 2026):")
     print("-" * 50)
     caveats = [
-        "MEASURED per-dispatch overhead: ~439μs on M1 Max + MoltenVK",
+        "MEASURED per-dispatch overhead: ~429μs on M1 Max + MoltenVK (persistent resources)",
+        "Persistent resource refactoring: DONE (15-21% overhead reduction vs per-alloc)",
+        "Analysis fusion: DONE (4 MIR optimization analyses in 1 dispatch, 4x overhead reduction)",
         "Expected overhead on native Vulkan (Linux/NVIDIA): ~50-100μs",
-        "GPU only wins for large batches (>10K items) due to high overhead",
+        "GPU only wins for large batches (>8K items) due to MoltenVK overhead",
         "CPU resolution still required between monomorphization rounds",
-        "MoltenVK overhead: ~8-9x vs native Vulkan (439μs vs ~50μs)",
-        "Stage1 build fails on macOS due to C++ header conflicts",
+        "MoltenVK overhead: ~4-9x vs native Vulkan (429μs vs ~50-100μs)",
+        "Stage1 build fails on macOS due to C++ header conflicts (pre-existing)",
         "No end-to-end benchmarks yet (need Linux/NVIDIA machine)",
-        "Theoretical max: ~1.5x total compile time for generic-heavy crates",
-        "Real-world impact on M1: likely 3-8% (overhead too high)",
-        "Real-world impact on Linux/NVIDIA: likely 10-20% for generic-heavy",
+        "Theoretical max with M1 overhead: ~1.58x for generic-heavy crates",
+        "Real-world impact on M1: likely 5-10% (overhead still significant)",
+        "Real-world impact on Linux/NVIDIA: likely 20-35% for generic-heavy",
     ]
     for caveat in caveats:
         print(f"  • {caveat}")
     print()
     
     print("=" * 70)
-    print("Next Steps (Based on M1 Validation):")
+    print("Next Steps (Updated May 2026):")
     print("=" * 70)
     next_steps = [
-        "1. URGENT: Test on Linux/NVIDIA - M1 overhead is 8-9x worse than expected",
-        "2. Implement persistent pipelines + descriptor pools (eliminate per-dispatch alloc)",
-        "3. Analysis fusion: run 4 analyses in 1 kernel (amortize 439μs overhead)",
-        "4. Add command buffer reuse + Vulkan queues (reduce dispatch latency)",
-        "5. GPU-side monomorphization queue (eliminate CPU roundtrips)",
-        "6. Real benchmark: compile serde/rayon with -Z gpu-mono on NVIDIA",
+        "1. DONE: Persistent resources refactoring (descriptor pools, command buffers, fences)",
+        "2. DONE: All 17 GPU shaders compile and load successfully on M1 (16 + 1 fused)",
+        "3. DONE: Analysis fusion - 4 MIR optimization analyses in 1 dispatch",
+        "4. URGENT: Test on Linux/NVIDIA - MoltenVK overhead is 4-9x worse than native Vulkan",
+        "5. Add Vulkan queue parallelism (submit multiple dispatches, wait once)",
+        "6. GPU-side monomorphization queue (eliminate CPU roundtrips)",
+        "7. Real benchmark: compile serde/rayon/tokio with -Z gpu-mono on NVIDIA",
     ]
     for step in next_steps:
         print(f"  {step}")

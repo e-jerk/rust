@@ -4,24 +4,24 @@
     "mono_items": 100,
     "mir_bodies": 50,
     "dataflow_functions": 20,
-    "speedup": 1.0793239065929814,
-    "time_saved": 0.07349406986024899
+    "speedup": 1.0841057137173469,
+    "time_saved": 0.07758073096852562
   },
   {
     "name": "Small lib",
     "mono_items": 1000,
     "mir_bodies": 500,
     "dataflow_functions": 100,
-    "speedup": 1.2164150342320612,
-    "time_saved": 0.17791216660577272
+    "speedup": 1.2553417261154163,
+    "time_saved": 0.20340415745245466
   },
   {
     "name": "Medium lib",
     "mono_items": 5000,
     "mir_bodies": 2000,
     "dataflow_functions": 500,
-    "speedup": 1.388227828018404,
-    "time_saved": 0.2796571428571429
+    "speedup": 1.4649518703677367,
+    "time_saved": 0.31738371735791093
   },
   {
     "name": "Large lib (serde)",

@@ -279,7 +279,7 @@ pub fn gpu_collect_mono_items<'tcx>(
             persistent_bufs.offsets_buf.write(&serialized.body_offsets);
             persistent_bufs.reset_counter();
 
-            let dispatch = rustc_gpu_vulkan::dispatch::GpuDispatch::new(&backend.context);
+            let dispatch = rustc_gpu_vulkan::dispatch::GpuDispatch::new(&backend.context).ok()?;
             dispatch.dispatch_with_counter(
                 &pipeline,
                 &persistent_bufs.actions_buf,

@@ -116,4 +116,9 @@ fn main() {
         &out_dir,
         "PARTITION_SPV",
     );
+    compile_shader(
+        "src/shaders/fused_mir_opt.comp",
+        &out_dir,
+        "FUSED_MIR_OPT_SPV",
+    );
 }
