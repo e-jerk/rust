@@ -54,31 +54,50 @@ impl MetalDispatch {
         counter_buf: Option<&MetalBuffer>,
         num_bodies: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.dispatch_with_counter_batch(
+            &[(actions_buf, offsets_buf, edges_buf, counter_buf, num_bodies)],
+        )
+    }
+    
+    /// Batch dispatch: encode multiple dispatches into a single command buffer.
+    ///
+    /// Each tuple is (actions, offsets, edges, counter, num_bodies).
+    /// Amortizes command buffer overhead across N dispatches.
+    pub fn dispatch_with_counter_batch(
+        &self,
+        dispatches: &[(
+            &MetalBuffer, &MetalBuffer, &MetalBuffer, Option<&MetalBuffer>, u32,
+        )],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let cmd_buf = self.queue.new_command_buffer();
-        let encoder = cmd_buf.new_compute_command_encoder();
         
-        encoder.set_compute_pipeline_state(&self.pipeline);
-        
-        encoder.set_buffer(0, Some(&actions_buf.buffer), 0);
-        encoder.set_buffer(1, Some(&offsets_buf.buffer), 0);
-        encoder.set_buffer(2, Some(&edges_buf.buffer), 0);
-        
-        if let Some(counter) = counter_buf {
-            encoder.set_buffer(3, Some(&counter.buffer), 0);
+        for (actions_buf, offsets_buf, edges_buf, counter_buf, num_bodies) in dispatches {
+            let encoder = cmd_buf.new_compute_command_encoder();
+            
+            encoder.set_compute_pipeline_state(&self.pipeline);
+            
+            encoder.set_buffer(0, Some(&actions_buf.buffer), 0);
+            encoder.set_buffer(1, Some(&offsets_buf.buffer), 0);
+            encoder.set_buffer(2, Some(&edges_buf.buffer), 0);
+            
+            if let Some(counter) = counter_buf {
+                encoder.set_buffer(3, Some(&counter.buffer), 0);
+            }
+            
+            let push_constants = *num_bodies;
+            encoder.set_bytes(
+                4,
+                std::mem::size_of::<u32>() as u64,
+                &push_constants as *const _ as *const c_void,
+            );
+            
+            let grid_size = metal::MTLSize::new(*num_bodies as u64, 1, 1);
+            let threadgroup_size = metal::MTLSize::new(64, 1, 1);
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+            
+            encoder.end_encoding();
         }
         
-        let push_constants = num_bodies;
-        encoder.set_bytes(
-            4,
-            std::mem::size_of::<u32>() as u64,
-            &push_constants as *const _ as *const c_void,
-        );
-        
-        let grid_size = metal::MTLSize::new(num_bodies as u64, 1, 1);
-        let threadgroup_size = metal::MTLSize::new(64, 1, 1);
-        encoder.dispatch_threads(grid_size, threadgroup_size);
-        
-        encoder.end_encoding();
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
         

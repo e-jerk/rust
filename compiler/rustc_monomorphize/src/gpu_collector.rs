@@ -224,41 +224,46 @@ fn gpu_collect_mono_items_metal<'tcx>(
     let mut total_cpu_time = std::time::Duration::ZERO;
     let mut rounds = 0;
 
-    // Pipelined processing: prepare next batch while GPU works on current
+    // Pipelined processing with batch dispatch: dispatch up to 2 batches
+    // simultaneously in a single command buffer to amortize overhead.
     let mut pending_gpu = false;
-    let mut next_batch: Option<(Vec<MonoItem<'tcx>>, SerializedBatch<'tcx>)> = None;
+    let mut next_batches: Vec<(Vec<MonoItem<'tcx>>, SerializedBatch<'tcx>)> = Vec::new();
+    const BATCH_COUNT: usize = 2;
     
-    // Persistent buffers — allocate once, reuse across dispatches
-    // Metal has unified memory so this is very cheap
-    let persistent_actions_buf = backend.create_buffer(
-        (MAX_ACTIONS_PER_BATCH * std::mem::size_of::<GpuMonoAction>()) as u64
-    )?;
-    let persistent_offsets_buf = backend.create_buffer(
-        (GPU_BATCH_SIZE * 2 * std::mem::size_of::<u32>()) as u64
-    )?;
-    let persistent_edges_buf = backend.create_buffer(
-        (MAX_EDGES_PER_BATCH * std::mem::size_of::<GpuEdge>()) as u64
-    )?;
-    let persistent_counter_buf = backend.create_buffer(4)?;
+    // Persistent buffers — allocate BATCH_COUNT sets
+    let mut persistent_actions_bufs = Vec::with_capacity(BATCH_COUNT);
+    let mut persistent_offsets_bufs = Vec::with_capacity(BATCH_COUNT);
+    let mut persistent_edges_bufs = Vec::with_capacity(BATCH_COUNT);
+    let mut persistent_counter_bufs = Vec::with_capacity(BATCH_COUNT);
+    for _ in 0..BATCH_COUNT {
+        persistent_actions_bufs.push(backend.create_buffer(
+            (MAX_ACTIONS_PER_BATCH * std::mem::size_of::<GpuMonoAction>()) as u64
+        )?);
+        persistent_offsets_bufs.push(backend.create_buffer(
+            (GPU_BATCH_SIZE * 2 * std::mem::size_of::<u32>()) as u64
+        )?);
+        persistent_edges_bufs.push(backend.create_buffer(
+            (MAX_EDGES_PER_BATCH * std::mem::size_of::<GpuEdge>()) as u64
+        )?);
+        persistent_counter_bufs.push(backend.create_buffer(4)?);
+    }
 
     while !queue.is_empty() || pending_gpu {
         rounds += 1;
         
-        // If we have a pending GPU batch, wait for it and process results
+        // If we have pending GPU batches, wait for them and process results
         if pending_gpu {
             let gpu_start = std::time::Instant::now();
-            
-            // Read atomic counter to know how many edges were written
-            let counter_data: Vec<u32> = persistent_counter_buf.read(1);
-            let edge_count = counter_data[0] as usize;
-            let edges: Vec<GpuEdge> = persistent_edges_buf.read(edge_count.min(MAX_EDGES_PER_BATCH));
-            
             total_gpu_time += gpu_start.elapsed();
             
-            // Resolve edges on CPU (can overlap with next GPU dispatch)
             let cpu_start = std::time::Instant::now();
             
-            if let Some((batch, serialized)) = next_batch.take() {
+            for (batch_idx, (batch, serialized)) in next_batches.drain(..).enumerate() {
+                let counter_data: Vec<u32> = persistent_counter_bufs[batch_idx].read(1);
+                let edge_count = counter_data[0] as usize;
+                let edges: Vec<GpuEdge> = persistent_edges_bufs[batch_idx]
+                    .read(edge_count.min(MAX_EDGES_PER_BATCH));
+                
                 for edge in &edges {
                     if edge.def_id_krate == 0 && edge.def_id_index == 0 {
                         continue;
@@ -287,33 +292,42 @@ fn gpu_collect_mono_items_metal<'tcx>(
             break;
         }
         
-        // Prepare and dispatch next batch if items available
+        // Prepare and dispatch up to BATCH_COUNT batches simultaneously
         if !queue.is_empty() {
-            let batch_size = GPU_BATCH_SIZE.min(queue.len());
-            let batch: Vec<_> = queue.drain(..batch_size).collect();
+            let mut batch_dispatches = Vec::new();
+            let mut num_batches = 0;
             
-            let cpu_start = std::time::Instant::now();
-            let serialized = serialize_batch(tcx, &batch);
-            total_cpu_time += cpu_start.elapsed();
+            for batch_idx in 0..BATCH_COUNT {
+                if queue.is_empty() { break; }
+                
+                let batch_size = GPU_BATCH_SIZE.min(queue.len());
+                let batch: Vec<_> = queue.drain(..batch_size).collect();
+                
+                let cpu_start = std::time::Instant::now();
+                let serialized = serialize_batch(tcx, &batch);
+                total_cpu_time += cpu_start.elapsed();
+                
+                persistent_actions_bufs[batch_idx].write(&serialized.actions);
+                persistent_offsets_bufs[batch_idx].write(&serialized.body_offsets);
+                persistent_counter_bufs[batch_idx].write(&[0u32]);
+                
+                batch_dispatches.push((
+                    &persistent_actions_bufs[batch_idx],
+                    &persistent_offsets_bufs[batch_idx],
+                    &persistent_edges_bufs[batch_idx],
+                    Some(&persistent_counter_bufs[batch_idx]),
+                    serialized.instances.len() as u32,
+                ));
+                
+                next_batches.push((batch, serialized));
+                num_batches += 1;
+            }
             
-            // Write to persistent buffers and dispatch GPU
+            // Dispatch all batches in a single command buffer
             let gpu_start = std::time::Instant::now();
-            
-            persistent_actions_buf.write(&serialized.actions);
-            persistent_offsets_buf.write(&serialized.body_offsets);
-            persistent_counter_buf.write(&[0u32]);
-            
-            dispatch.dispatch_with_counter(
-                &persistent_actions_buf,
-                &persistent_offsets_buf,
-                &persistent_edges_buf,
-                Some(&persistent_counter_buf),
-                serialized.instances.len() as u32,
-            ).ok()?;
-            
+            dispatch.dispatch_with_counter_batch(&batch_dispatches).ok()?;
             total_gpu_time += gpu_start.elapsed();
             
-            next_batch = Some((batch, serialized));
             pending_gpu = true;
         }
     }
