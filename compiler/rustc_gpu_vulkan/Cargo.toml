@@ -1,0 +1,10 @@
+[package]
+name = "rustc_gpu_vulkan"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+ash = "0.38"
+gpu-alloc = "0.6"
+gpu-alloc-ash = "0.6"
+tracing = "0.1"
