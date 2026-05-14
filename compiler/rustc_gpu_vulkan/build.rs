@@ -96,4 +96,19 @@ fn main() {
         &out_dir,
         "INDUCTION_VAR_SPV",
     );
+    compile_shader(
+        "src/shaders/mega_batch_dataflow.comp",
+        &out_dir,
+        "MEGA_BATCH_DATAFLOW_SPV",
+    );
+    compile_shader(
+        "src/shaders/macro_expand.comp",
+        &out_dir,
+        "MACRO_EXPAND_SPV",
+    );
+    compile_shader(
+        "src/shaders/borrow_check.comp",
+        &out_dir,
+        "BORROW_CHECK_SPV",
+    );
 }

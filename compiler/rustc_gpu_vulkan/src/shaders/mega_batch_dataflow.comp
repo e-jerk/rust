@@ -1,0 +1,123 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+// MEGA-BATCH DATAFLOW:
+// Process N functions simultaneously in one dispatch.
+// 
+// Memory layout:
+// [Function 0 data] [Function 1 data] ... [Function N-1 data]
+// Each function has: configs, effects, entry_states, exit_states
+//
+// Workgroup: 256 threads
+// - Each thread processes one basic block from one function
+// - Thread idx = block_idx within its assigned function
+// - Functions are distributed across workgroups
+
+// Function metadata: [num_blocks, num_locals, effects_stride, data_offset]
+layout(set = 0, binding = 0) readonly buffer FunctionMeta {
+    uint data[];
+} function_meta;
+
+// All block configs concatenated
+layout(set = 0, binding = 1) readonly buffer AllConfigs {
+    uint data[];
+} all_configs;
+
+// All effects concatenated
+layout(set = 0, binding = 2) readonly buffer AllEffects {
+    uint data[];
+} all_effects;
+
+// All entry states concatenated
+layout(set = 0, binding = 3) buffer AllEntryStates {
+    uint data[];
+} all_entry_states;
+
+// All exit states concatenated
+layout(set = 0, binding = 4) buffer AllExitStates {
+    uint data[];
+} all_exit_states;
+
+// Convergence: one flag per function
+layout(set = 0, binding = 5) buffer Convergence {
+    uint data[];
+} convergence;
+
+layout(push_constant) uniform PushConstants {
+    uint num_functions;
+    uint blocks_per_workgroup;
+    uint max_bitset_words;
+} pc;
+
+// Effect kinds
+#define EFFECT_NOP 0
+#define EFFECT_KILL 1
+#define EFFECT_GEN 2
+
+void main() {
+    uint global_idx = gl_GlobalInvocationID.x;
+    
+    // Determine which function and which block this thread handles
+    uint func_idx = global_idx / pc.blocks_per_workgroup;
+    uint block_idx = global_idx % pc.blocks_per_workgroup;
+    
+    if (func_idx >= pc.num_functions) return;
+    
+    // Read function metadata
+    uint meta_offset = func_idx * 4;
+    uint num_blocks = function_meta.data[meta_offset];
+    uint num_locals = function_meta.data[meta_offset + 1];
+    uint effects_stride = function_meta.data[meta_offset + 2];
+    uint data_offset = function_meta.data[meta_offset + 3];
+    
+    if (block_idx >= num_blocks) return;
+    
+    uint bitset_words = (num_locals + 31) / 32;
+    
+    // Read block config
+    uint config_offset = data_offset + block_idx * 4;
+    uint stmt_count = all_configs.data[config_offset];
+    
+    // Read entry state for this block
+    uint state_start = data_offset + block_idx * bitset_words;
+    uint state[32]; // Max 1024 locals
+    
+    uint max_words = min(bitset_words, pc.max_bitset_words);
+    for (uint w = 0; w < max_words; w++) {
+        state[w] = all_entry_states.data[state_start + w];
+    }
+    
+    // Apply effects forward through statements
+    for (uint stmt_idx = 0; stmt_idx < stmt_count; stmt_idx++) {
+        uint effect = all_effects.data[data_offset + block_idx * effects_stride + stmt_idx];
+        uint kind = effect >> 24;
+        uint local = effect & 0xFFFFFF;
+        
+        if (local >= num_locals) continue;
+        
+        uint word = local / 32;
+        uint bit = local % 32;
+        uint mask = 1u << bit;
+        
+        if (kind == EFFECT_GEN) {
+            state[word] |= mask;
+        } else if (kind == EFFECT_KILL) {
+            state[word] &= ~mask;
+        }
+    }
+    
+    // Write exit state
+    bool changed = false;
+    for (uint w = 0; w < max_words; w++) {
+        uint old = all_exit_states.data[state_start + w];
+        if (old != state[w]) {
+            all_exit_states.data[state_start + w] = state[w];
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        atomicOr(convergence.data[func_idx], 1);
+    }
+}

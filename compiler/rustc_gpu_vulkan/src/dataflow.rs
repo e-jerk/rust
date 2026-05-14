@@ -1242,6 +1242,178 @@ impl<'ctx> GpuDataflowEngine<'ctx> {
 
         Ok(())
     }
+
+    /// Dispatch mega-batch dataflow kernel.
+    ///
+    /// Processes N functions simultaneously in one GPU dispatch.
+    /// This amortizes kernel launch overhead across many functions.
+    pub fn dispatch_mega_batch_round(
+        &self,
+        meta_buf: &GpuBuffer,
+        config_buf: &GpuBuffer,
+        effects_buf: &GpuBuffer,
+        entry_buf: &GpuBuffer,
+        exit_buf: &GpuBuffer,
+        convergence_buf: &GpuBuffer,
+        num_functions: u32,
+        blocks_per_workgroup: u32,
+        max_bitset_words: u32,
+    ) -> Result<(), vk::Result> {
+        let device = &self.context.device;
+
+        // Clear convergence flags
+        unsafe {
+            let ptr = convergence_buf.mapped as *mut u32;
+            for i in 0..num_functions {
+                *ptr.add(i as usize) = 0;
+            }
+        }
+
+        // Allocate descriptor pool
+        let descriptor_pool = unsafe {
+            let pool_size = vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(6);
+            let create_info = vk::DescriptorPoolCreateInfo::default()
+                .pool_sizes(std::slice::from_ref(&pool_size))
+                .max_sets(1);
+            device.create_descriptor_pool(&create_info, None)?
+        };
+
+        let descriptor_set = unsafe {
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
+            device.allocate_descriptor_sets(&alloc_info)?[0]
+        };
+
+        // Write descriptor set
+        let buffer_infos = [
+            vk::DescriptorBufferInfo::default().buffer(meta_buf.buffer).range(meta_buf.size),
+            vk::DescriptorBufferInfo::default().buffer(config_buf.buffer).range(config_buf.size),
+            vk::DescriptorBufferInfo::default().buffer(effects_buf.buffer).range(effects_buf.size),
+            vk::DescriptorBufferInfo::default().buffer(entry_buf.buffer).range(entry_buf.size),
+            vk::DescriptorBufferInfo::default().buffer(exit_buf.buffer).range(exit_buf.size),
+            vk::DescriptorBufferInfo::default().buffer(convergence_buf.buffer).range(convergence_buf.size),
+        ];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_infos[0])),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_infos[1])),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_infos[2])),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_infos[3])),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_infos[4])),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_infos[5])),
+        ];
+        unsafe { device.update_descriptor_sets(&writes, &[]); }
+
+        // Record command buffer
+        let cmd_buf = unsafe {
+            let alloc_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.context.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            device.allocate_command_buffers(&alloc_info)?[0]
+        };
+
+        unsafe {
+            let begin_info = vk::CommandBufferBeginInfo::default();
+            device.begin_command_buffer(cmd_buf, &begin_info)?;
+
+            device.cmd_bind_pipeline(cmd_buf, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            device.cmd_bind_descriptor_sets(
+                cmd_buf,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                std::slice::from_ref(&descriptor_set),
+                &[],
+            );
+
+            // Push constants
+            let push_constants = [num_functions, blocks_per_workgroup, max_bitset_words];
+            let push_bytes = std::slice::from_raw_parts(
+                push_constants.as_ptr() as *const u8,
+                push_constants.len() * std::mem::size_of::<u32>(),
+            );
+            device.cmd_push_constants(
+                cmd_buf,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push_bytes,
+            );
+
+            // Dispatch: local_size_x = 256
+            // Each workgroup processes blocks_per_workgroup blocks per function
+            let total_blocks = num_functions * blocks_per_workgroup;
+            let workgroup_count = (total_blocks + 255) / 256;
+            device.cmd_dispatch(cmd_buf, workgroup_count, 1, 1);
+
+            // Memory barrier
+            let barriers = [
+                vk::BufferMemoryBarrier::default()
+                    .buffer(exit_buf.buffer)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .size(vk::WHOLE_SIZE),
+                vk::BufferMemoryBarrier::default()
+                    .buffer(convergence_buf.buffer)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .size(vk::WHOLE_SIZE),
+            ];
+            device.cmd_pipeline_barrier(
+                cmd_buf,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barriers,
+                &[],
+            );
+
+            device.end_command_buffer(cmd_buf)?;
+        }
+
+        // Submit
+        let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd_buf));
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        unsafe { device.queue_submit(self.context.queue, std::slice::from_ref(&submit_info), fence)?; }
+        unsafe { device.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?; }
+
+        // Cleanup
+        unsafe {
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(self.context.command_pool, std::slice::from_ref(&cmd_buf));
+            device.destroy_descriptor_pool(descriptor_pool, None);
+        }
+
+        Ok(())
+    }
 }
 
 impl<'ctx> Drop for GpuDataflowEngine<'ctx> {

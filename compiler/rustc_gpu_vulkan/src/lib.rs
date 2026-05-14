@@ -129,6 +129,30 @@ pub fn load_induction_var_shader() -> Option<Vec<u8>> {
     }
 }
 
+pub fn load_mega_batch_dataflow_shader() -> Option<Vec<u8>> {
+    if let Ok(spv_path) = std::env::var("MEGA_BATCH_DATAFLOW_SPV") {
+        std::fs::read(spv_path).ok()
+    } else {
+        None
+    }
+}
+
+pub fn load_macro_expand_shader() -> Option<Vec<u8>> {
+    if let Ok(spv_path) = std::env::var("MACRO_EXPAND_SPV") {
+        std::fs::read(spv_path).ok()
+    } else {
+        None
+    }
+}
+
+pub fn load_borrow_check_shader() -> Option<Vec<u8>> {
+    if let Ok(spv_path) = std::env::var("BORROW_CHECK_SPV") {
+        std::fs::read(spv_path).ok()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

@@ -1,0 +1,142 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// GPU-accelerated borrow check pre-analysis:
+// Compute liveness, move analysis, and initialization tracking
+// for borrow checking in parallel.
+//
+// This is a simplified version that tracks:
+// 1. Which locals are alive at each point
+// 2. Which locals have been moved (consumed)
+// 3. Which locals have been initialized
+//
+// The actual borrow checking rules are applied on CPU using these
+// computed facts.
+
+// Block configs: [num_statements, terminator_kind, ...]
+layout(set = 0, binding = 0) readonly buffer BlockConfigs {
+    uint data[];
+} configs;
+
+// Statement effects: encoded (kind << 24) | local
+// kind: 1 = init, 2 = move, 3 = borrow_mut, 4 = borrow_shared, 5 = drop
+layout(set = 0, binding = 1) readonly buffer Effects {
+    uint data[];
+} effects;
+
+// Live state: which locals are alive
+layout(set = 0, binding = 2) buffer LiveStates {
+    uint data[];
+} live_states;
+
+// Moved state: which locals have been moved
+layout(set = 0, binding = 3) buffer MovedStates {
+    uint data[];
+} moved_states;
+
+// Init state: which locals have been initialized
+layout(set = 0, binding = 4) buffer InitStates {
+    uint data[];
+} init_states;
+
+// Convergence
+layout(set = 0, binding = 5) buffer Convergence {
+    uint changed;
+} convergence;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint num_locals;
+    uint effects_stride;
+} pc;
+
+#define EFFECT_INIT 1
+#define EFFECT_MOVE 2
+#define EFFECT_BORROW_MUT 3
+#define EFFECT_BORROW_SHARED 4
+#define EFFECT_DROP 5
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+    
+    uint config_base = block_idx * 4;
+    uint stmt_count = configs.data[config_base];
+    
+    uint words = (pc.num_locals + 31) / 32;
+    uint state_start = block_idx * words;
+    
+    // Read current states
+    uint live[32];
+    uint moved[32];
+    uint init[32];
+    
+    uint max_words = min(words, 32);
+    for (uint w = 0; w < max_words; w++) {
+        live[w] = live_states.data[state_start + w];
+        moved[w] = moved_states.data[state_start + w];
+        init[w] = init_states.data[state_start + w];
+    }
+    
+    // Apply effects
+    for (uint stmt_idx = 0; stmt_idx < stmt_count; stmt_idx++) {
+        uint effect = effects.data[block_idx * pc.effects_stride + stmt_idx];
+        uint kind = effect >> 24;
+        uint local = effect & 0xFFFFFF;
+        
+        if (local >= pc.num_locals) continue;
+        
+        uint word = local / 32;
+        uint bit = local % 32;
+        uint mask = 1u << bit;
+        
+        switch (kind) {
+            case EFFECT_INIT:
+                init[word] |= mask;
+                live[word] |= mask;
+                moved[word] &= ~mask;
+                break;
+            case EFFECT_MOVE:
+                moved[word] |= mask;
+                break;
+            case EFFECT_BORROW_MUT:
+                // Mutable borrow requires live and not moved
+                if ((live[word] & mask) != 0 && (moved[word] & mask) == 0) {
+                    live[word] |= mask;
+                }
+                break;
+            case EFFECT_BORROW_SHARED:
+                // Shared borrow requires live and not mutably borrowed
+                if ((live[word] & mask) != 0) {
+                    live[word] |= mask;
+                }
+                break;
+            case EFFECT_DROP:
+                live[word] &= ~mask;
+                init[word] &= ~mask;
+                break;
+        }
+    }
+    
+    // Write back
+    bool changed = false;
+    for (uint w = 0; w < max_words; w++) {
+        if (live_states.data[state_start + w] != live[w]) {
+            live_states.data[state_start + w] = live[w];
+            changed = true;
+        }
+        if (moved_states.data[state_start + w] != moved[w]) {
+            moved_states.data[state_start + w] = moved[w];
+            changed = true;
+        }
+        if (init_states.data[state_start + w] != init[w]) {
+            init_states.data[state_start + w] = init[w];
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        atomicOr(convergence.changed, 1);
+    }
+}

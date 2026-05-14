@@ -1,0 +1,97 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+// GPU-accelerated macro expansion:
+// Process multiple macro invocations in parallel.
+//
+// Each thread handles one macro invocation.
+// Input: token stream (simplified: identifiers, literals, punctuation)
+// Output: expanded token stream
+//
+// For MVP, we only handle simple declarative macros (macro_rules)
+// that do pattern matching without complex TT-munching.
+
+// Macro invocation descriptors
+// [macro_id, num_input_tokens, input_offset, max_output_tokens, output_offset, actual_output]
+layout(set = 0, binding = 0) buffer Invocations {
+    uint data[];
+} invocations;
+
+// Input token stream: concatenated token IDs
+layout(set = 0, binding = 1) readonly buffer InputTokens {
+    uint data[];
+} input_tokens;
+
+// Output token stream: concatenated token IDs
+layout(set = 0, binding = 2) buffer OutputTokens {
+    uint data[];
+} output_tokens;
+
+// Macro rules: for each macro, a sequence of pattern template pairs
+// Simplified: we use hardcoded rules for common patterns
+layout(set = 0, binding = 3) readonly buffer MacroRules {
+    uint data[];
+} macro_rules;
+
+layout(push_constant) uniform PushConstants {
+    uint num_invocations;
+} pc;
+
+// Token types (simplified)
+#define TOK_IDENT 1
+#define TOK_LIT 2
+#define TOK_PUNCT 3
+#define TOK_EOF 0xFFFFFFFF
+
+// Simple macro expansion:
+// For each input token, look it up in the macro's rule table.
+// If it matches a pattern, emit the template tokens.
+// Otherwise, pass through unchanged.
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.num_invocations) return;
+    
+    // Read invocation descriptor
+    uint inv_offset = idx * 5;
+    uint macro_id = invocations.data[inv_offset];
+    uint num_input = invocations.data[inv_offset + 1];
+    uint input_off = invocations.data[inv_offset + 2];
+    uint max_output = invocations.data[inv_offset + 3];
+    uint output_off = invocations.data[inv_offset + 4];
+    
+    // For each input token, try to expand it
+    uint output_count = 0;
+    for (uint i = 0; i < num_input && output_count < max_output; i++) {
+        uint token = input_tokens.data[input_off + i];
+        
+        // Try macro rules (simplified: direct substitution)
+        bool expanded = false;
+        uint rule_base = macro_id * 1024; // Max 1024 rules per macro
+        
+        for (uint r = 0; r < 1024 && !expanded; r++) {
+            uint pattern = macro_rules.data[rule_base + r * 2];
+            if (pattern == TOK_EOF) break;
+            
+            if (pattern == token) {
+                // Match! Emit template tokens
+                uint template_token = macro_rules.data[rule_base + r * 2 + 1];
+                if (template_token != TOK_EOF && output_count < max_output) {
+                    output_tokens.data[output_off + output_count] = template_token;
+                    output_count++;
+                }
+                expanded = true;
+            }
+        }
+        
+        if (!expanded && output_count < max_output) {
+            // Pass through unchanged
+            output_tokens.data[output_off + output_count] = token;
+            output_count++;
+        }
+    }
+    
+    // Write output count back to invocation descriptor
+    invocations.data[inv_offset + 3] = output_count;
+}
