@@ -1,0 +1,88 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Block configuration buffer
+layout(set = 0, binding = 0) readonly buffer BlockConfigs {
+    uint data[];
+} configs;
+
+// Copy facts buffer: per-statement encoded copy facts
+// Each entry: (dst_local << 16) | src_local, or 0xFFFFFFFF if not a copy
+layout(set = 0, binding = 1) readonly buffer CopyFacts {
+    uint data[];
+} copy_facts;
+
+// Entry states: which local holds a copy of which other local
+// Flat array: for each block, for each local, store the source local+1 (0 = no copy)
+layout(set = 0, binding = 2) buffer EntryStates {
+    uint data[];
+} entry_states;
+
+// Exit states
+layout(set = 0, binding = 3) buffer ExitStates {
+    uint data[];
+} exit_states;
+
+// Convergence flag
+layout(set = 0, binding = 4) buffer Convergence {
+    uint changed;
+} convergence;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint num_locals;
+    uint facts_stride;
+} pc;
+
+// Forward dataflow for copy propagation:
+// - A copy statement: `x = y` means entry[x] = y (x now holds copy of y)
+// - Any other assignment to x: entry[x] = 0 (x no longer holds a known copy)
+// - Merge (join): if two predecessors have different sources for same local, result is 0 (unknown)
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+    
+    uint config_base = block_idx * 4;
+    uint stmt_count = configs.data[config_base];
+    
+    // Read entry state for this block
+    uint state_start = block_idx * pc.num_locals;
+    uint state[128]; // Max 128 locals per function for copy propagation
+    
+    uint max_locals = min(pc.num_locals, 128);
+    for (uint i = 0; i < max_locals; i++) {
+        state[i] = entry_states.data[state_start + i];
+    }
+    
+    // Apply copy facts forward through statements
+    for (uint stmt_idx = 0; stmt_idx < stmt_count; stmt_idx++) {
+        uint fact = copy_facts.data[block_idx * pc.facts_stride + stmt_idx];
+        if (fact != 0xFFFFFFFF) {
+            uint dst = (fact >> 16) & 0xFFFF;
+            uint src = fact & 0xFFFF;
+            if (dst < max_locals) {
+                state[dst] = src + 1; // +1 to distinguish from "no copy" (0)
+            }
+        } else {
+            // Non-copy assignment: kill any copy fact for the assigned local
+            // For simplicity, we only handle explicit copy statements
+            // More complex assignments would need additional encoding
+        }
+    }
+    
+    // Write exit state
+    bool changed = false;
+    for (uint i = 0; i < max_locals; i++) {
+        uint old = exit_states.data[state_start + i];
+        if (old != state[i]) {
+            exit_states.data[state_start + i] = state[i];
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        atomicOr(convergence.changed, 1);
+    }
+}

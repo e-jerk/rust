@@ -51,4 +51,9 @@ fn main() {
         &out_dir,
         "DEAD_STORE_ELIM_SPV",
     );
+    compile_shader(
+        "src/shaders/copy_prop.comp",
+        &out_dir,
+        "COPY_PROP_SPV",
+    );
 }
