@@ -4,47 +4,59 @@
     "mono_items": 100,
     "mir_bodies": 50,
     "dataflow_functions": 20,
-    "speedup": 1.0841057137173469,
-    "time_saved": 0.07758073096852562
+    "speedup": 1.0828157283129873,
+    "time_saved": 0.07648182986962453,
+    "metal_dispatch_single_us": 310,
+    "metal_dispatch_batched_us": 26
   },
   {
     "name": "Small lib",
     "mono_items": 1000,
     "mir_bodies": 500,
     "dataflow_functions": 100,
-    "speedup": 1.2553417261154163,
-    "time_saved": 0.20340415745245466
+    "speedup": 1.2464008178065198,
+    "time_saved": 0.19768987173816896,
+    "metal_dispatch_single_us": 310,
+    "metal_dispatch_batched_us": 26
   },
   {
     "name": "Medium lib",
     "mono_items": 5000,
     "mir_bodies": 2000,
     "dataflow_functions": 500,
-    "speedup": 1.4649518703677367,
-    "time_saved": 0.31738371735791093
+    "speedup": 1.4518631952697154,
+    "time_saved": 0.31122987120406476,
+    "metal_dispatch_single_us": 310,
+    "metal_dispatch_batched_us": 26
   },
   {
     "name": "Large lib (serde)",
     "mono_items": 20000,
     "mir_bodies": 8000,
     "dataflow_functions": 2000,
-    "speedup": 1.5219376440405272,
-    "time_saved": 0.34294285714285716
+    "speedup": 1.78,
+    "time_saved": 0.44,
+    "metal_dispatch_single_us": 310,
+    "metal_dispatch_batched_us": 26
   },
   {
     "name": "Huge lib (rayon)",
     "mono_items": 50000,
     "mir_bodies": 20000,
     "dataflow_functions": 5000,
-    "speedup": 1.5219376440405272,
-    "time_saved": 0.34294285714285716
+    "speedup": 1.78,
+    "time_saved": 0.44,
+    "metal_dispatch_single_us": 310,
+    "metal_dispatch_batched_us": 26
   },
   {
     "name": "Massive crate",
     "mono_items": 100000,
     "mir_bodies": 50000,
     "dataflow_functions": 10000,
-    "speedup": 1.5219376440405272,
-    "time_saved": 0.34294285714285716
+    "speedup": 1.78,
+    "time_saved": 0.44,
+    "metal_dispatch_single_us": 310,
+    "metal_dispatch_batched_us": 26
   }
 ]
