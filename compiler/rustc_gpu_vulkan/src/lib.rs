@@ -9,15 +9,38 @@ pub mod shader;
 use gpu_alloc as _;
 use gpu_alloc_ash as _;
 use tracing as _;
+use std::cell::RefCell;
 use std::sync::Arc;
 
+thread_local! {
+    static GPU_BACKEND: RefCell<Option<GpuBackend>> = RefCell::new(None);
+}
+
 /// Feature-gated GPU backend. Returns None if Vulkan unavailable.
+/// Uses thread-local caching to avoid recreating the instance/device per call.
 pub struct GpuBackend {
     pub context: Arc<context::GpuContext>,
 }
 
+impl Clone for GpuBackend {
+    fn clone(&self) -> Self {
+        GpuBackend {
+            context: Arc::clone(&self.context),
+        }
+    }
+}
+
 impl GpuBackend {
     pub fn new() -> Option<Self> {
+        GPU_BACKEND.with(|b| {
+            if b.borrow().is_none() {
+                *b.borrow_mut() = Self::create();
+            }
+            b.borrow().clone()
+        })
+    }
+
+    fn create() -> Option<Self> {
         let context = context::GpuContext::new().ok()?;
         Some(GpuBackend { context: Arc::new(context) })
     }

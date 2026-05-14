@@ -3,15 +3,38 @@ pub mod context;
 pub mod dataflow;
 pub mod dispatch;
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
+thread_local! {
+    static METAL_BACKEND: RefCell<Option<MetalBackend>> = RefCell::new(None);
+}
+
 /// Feature-gated Metal GPU backend. Returns None if Metal unavailable.
+/// Uses thread-local caching to avoid recreating the device/context per call.
 pub struct MetalBackend {
     pub context: Arc<context::MetalContext>,
 }
 
+impl Clone for MetalBackend {
+    fn clone(&self) -> Self {
+        MetalBackend {
+            context: Arc::clone(&self.context),
+        }
+    }
+}
+
 impl MetalBackend {
     pub fn new() -> Option<Self> {
+        METAL_BACKEND.with(|b| {
+            if b.borrow().is_none() {
+                *b.borrow_mut() = Self::create();
+            }
+            b.borrow().clone()
+        })
+    }
+
+    fn create() -> Option<Self> {
         let context = context::MetalContext::new().ok()?;
         Some(MetalBackend { context: Arc::new(context) })
     }
