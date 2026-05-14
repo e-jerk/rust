@@ -19,5 +19,6 @@ pub struct DeadCodeLivenessSnapshot {
 #[derive(Clone, Debug, StableHash)]
 pub struct DeadCodeLivenessSummary {
     pub pre_deferred_seeding: DeadCodeLivenessSnapshot,
+    pub pre_unconstructable_pubs: DeadCodeLivenessSnapshot,
     pub final_result: DeadCodeLivenessSnapshot,
 }

@@ -924,6 +924,8 @@ pub(crate) enum MultipleDeadCodes<'tcx> {
         #[subdiagnostic]
         dead_code_pub_in_binary_note: Option<DeadCodePubInBinaryNote>,
         #[subdiagnostic]
+        unconstructable_pub_struct_note: Option<UnconstructablePubStructNote>,
+        #[subdiagnostic]
         // only on DeadCodes since it's never a problem for tuple struct fields
         enum_variants_with_same_name: Vec<EnumVariantSameName<'tcx>>,
         #[subdiagnostic]
@@ -949,6 +951,8 @@ pub(crate) enum MultipleDeadCodes<'tcx> {
         #[subdiagnostic]
         dead_code_pub_in_binary_note: Option<DeadCodePubInBinaryNote>,
         #[subdiagnostic]
+        unconstructable_pub_struct_note: Option<UnconstructablePubStructNote>,
+        #[subdiagnostic]
         change_fields_suggestion: ChangeFields,
         #[subdiagnostic]
         parent_info: Option<ParentInfo<'tcx>>,
@@ -962,6 +966,12 @@ pub(crate) enum MultipleDeadCodes<'tcx> {
     "in libraries, `pub` items can be used by dependent crates; in binaries, they cannot, so this `pub` item is unused"
 )]
 pub(crate) struct DeadCodePubInBinaryNote;
+
+#[derive(Subdiagnostic)]
+#[note(
+    "this `pub` struct is unconstructable externally and never constructed locally, so consider providing a pub constructor or removing this"
+)]
+pub(crate) struct UnconstructablePubStructNote;
 
 #[derive(Subdiagnostic)]
 #[note(
