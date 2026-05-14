@@ -1,0 +1,11 @@
+[package]
+name = "rustc_gpu_metal"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+metal = "0.24"
+objc = "0.2"
+cocoa = "0.25"
+
+[build-dependencies]
