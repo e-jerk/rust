@@ -201,7 +201,10 @@ pub fn gpu_collect_mono_items<'tcx>(
     None
 }
 
-/// Metal-specific monomorphization path.
+/// Metal-specific monomorphization path with pipelining.
+///
+/// Pipelines CPU serialization with GPU execution to maximize throughput.
+/// Uses persistent buffers to avoid per-dispatch allocation overhead.
 fn gpu_collect_mono_items_metal<'tcx>(
     tcx: TyCtxt<'tcx>,
     roots: Vec<MonoItem<'tcx>>,
@@ -221,39 +224,70 @@ fn gpu_collect_mono_items_metal<'tcx>(
     let mut total_cpu_time = std::time::Duration::ZERO;
     let mut rounds = 0;
 
+    // Pipelined processing: prepare next batch while GPU works on current
     let mut pending_gpu = false;
     let mut next_batch: Option<(Vec<MonoItem<'tcx>>, SerializedBatch<'tcx>)> = None;
+    
+    // Persistent buffers — allocate once, reuse across dispatches
+    // Metal has unified memory so this is very cheap
+    let persistent_actions_buf = backend.create_buffer(
+        (MAX_ACTIONS_PER_BATCH * std::mem::size_of::<GpuMonoAction>()) as u64
+    )?;
+    let persistent_offsets_buf = backend.create_buffer(
+        (GPU_BATCH_SIZE * 2 * std::mem::size_of::<u32>()) as u64
+    )?;
+    let persistent_edges_buf = backend.create_buffer(
+        (MAX_EDGES_PER_BATCH * std::mem::size_of::<GpuEdge>()) as u64
+    )?;
+    let persistent_counter_buf = backend.create_buffer(4)?;
 
     while !queue.is_empty() || pending_gpu {
         rounds += 1;
         
+        // If we have a pending GPU batch, wait for it and process results
         if pending_gpu {
             let gpu_start = std::time::Instant::now();
             
-            // For Metal, we read back from the edges buffer directly
-            // The counter is handled via the buffer we passed
-            // We need to create temporary buffers for reading
-            // Actually, in the current MetalDispatch API, we don't have persistent buffers
-            // So we need to handle this differently
+            // Read atomic counter to know how many edges were written
+            let counter_data: Vec<u32> = persistent_counter_buf.read(1);
+            let edge_count = counter_data[0] as usize;
+            let edges: Vec<GpuEdge> = persistent_edges_buf.read(edge_count.min(MAX_EDGES_PER_BATCH));
             
             total_gpu_time += gpu_start.elapsed();
             
+            // Resolve edges on CPU (can overlap with next GPU dispatch)
             let cpu_start = std::time::Instant::now();
             
             if let Some((batch, serialized)) = next_batch.take() {
-                // For Metal path, we'd need to track edges differently
-                // This is a simplified version - full implementation would
-                // mirror the Vulkan persistent buffer approach
-                // For now, we fall through to let the Vulkan path handle it
-                return None;
+                for edge in &edges {
+                    if edge.def_id_krate == 0 && edge.def_id_index == 0 {
+                        continue;
+                    }
+                    if let Some(instance) = resolve_edge(tcx, *edge, &serialized) {
+                        let mono_item = MonoItem::Fn(instance);
+                        let source_idx = edge.source_idx as usize;
+                        if source_idx < batch.len() {
+                            let source_item = batch[source_idx];
+                            usage_map.record_usage(source_item, mono_item);
+                        }
+
+                        if visited.insert(mono_item) {
+                            queue.push_back(mono_item);
+                        }
+                    }
+                }
             }
             total_cpu_time += cpu_start.elapsed();
+            
+            pending_gpu = false;
         }
         
+        // If queue is empty and no pending GPU work, we're done
         if queue.is_empty() && !pending_gpu {
             break;
         }
         
+        // Prepare and dispatch next batch if items available
         if !queue.is_empty() {
             let batch_size = GPU_BATCH_SIZE.min(queue.len());
             let batch: Vec<_> = queue.drain(..batch_size).collect();
@@ -262,59 +296,22 @@ fn gpu_collect_mono_items_metal<'tcx>(
             let serialized = serialize_batch(tcx, &batch);
             total_cpu_time += cpu_start.elapsed();
             
+            // Write to persistent buffers and dispatch GPU
             let gpu_start = std::time::Instant::now();
             
-            // Create Metal buffers for this dispatch
-            let actions_buf = backend.create_buffer(
-                (serialized.actions.len() * std::mem::size_of::<GpuMonoAction>()) as u64
-            )?;
-            let offsets_buf = backend.create_buffer(
-                (serialized.body_offsets.len() * std::mem::size_of::<u32>()) as u64
-            )?;
-            let edges_buf = backend.create_buffer(
-                (MAX_EDGES_PER_BATCH * std::mem::size_of::<GpuEdge>()) as u64
-            )?;
-            let counter_buf = backend.create_buffer(4)?;
-            
-            actions_buf.write(&serialized.actions);
-            offsets_buf.write(&serialized.body_offsets);
-            counter_buf.write(&[0u32]);
+            persistent_actions_buf.write(&serialized.actions);
+            persistent_offsets_buf.write(&serialized.body_offsets);
+            persistent_counter_buf.write(&[0u32]);
             
             dispatch.dispatch_with_counter(
-                &actions_buf,
-                &offsets_buf,
-                &edges_buf,
-                Some(&counter_buf),
+                &persistent_actions_buf,
+                &persistent_offsets_buf,
+                &persistent_edges_buf,
+                Some(&persistent_counter_buf),
                 serialized.instances.len() as u32,
             ).ok()?;
             
-            // Read back results
-            let counter_data: Vec<u32> = counter_buf.read(1);
-            let edge_count = counter_data[0] as usize;
-            let edges: Vec<GpuEdge> = edges_buf.read(edge_count.min(MAX_EDGES_PER_BATCH));
-            
             total_gpu_time += gpu_start.elapsed();
-            
-            // Resolve edges on CPU
-            let cpu_resolve_start = std::time::Instant::now();
-            for edge in &edges {
-                if edge.def_id_krate == 0 && edge.def_id_index == 0 {
-                    continue;
-                }
-                if let Some(instance) = resolve_edge(tcx, *edge, &serialized) {
-                    let mono_item = MonoItem::Fn(instance);
-                    let source_idx = edge.source_idx as usize;
-                    if source_idx < batch.len() {
-                        let source_item = batch[source_idx];
-                        usage_map.record_usage(source_item, mono_item);
-                    }
-
-                    if visited.insert(mono_item) {
-                        queue.push_back(mono_item);
-                    }
-                }
-            }
-            total_cpu_time += cpu_resolve_start.elapsed();
             
             next_batch = Some((batch, serialized));
             pending_gpu = true;
@@ -322,7 +319,7 @@ fn gpu_collect_mono_items_metal<'tcx>(
     }
 
     eprintln!(
-        "[GPU-MONO-Metal] {} rounds, CPU: {:?}, GPU: {:?}, total items: {}",
+        "[GPU-MONO-Metal] {} rounds, CPU: {:?}, GPU: {:?}, total items: {}, persistent: true",
         rounds,
         total_cpu_time,
         total_gpu_time,

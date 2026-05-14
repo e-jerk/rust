@@ -41,9 +41,6 @@ impl MetalDataflowEngine {
     }
     
     /// Dispatch one dataflow round.
-    ///
-    /// Creates a command buffer, encodes the dispatch, commits, and waits for completion.
-    /// Metal's command buffer boundaries provide implicit synchronization.
     pub fn dispatch_round(
         &self,
         config_buf: &MetalBuffer,
@@ -60,14 +57,12 @@ impl MetalDataflowEngine {
         
         encoder.set_compute_pipeline_state(&self.pipeline);
         
-        // Bind buffers by index (no descriptor sets!)
         encoder.set_buffer(0, Some(&config_buf.buffer), 0);
         encoder.set_buffer(1, Some(&effects_buf.buffer), 0);
         encoder.set_buffer(2, Some(&entry_buf.buffer), 0);
         encoder.set_buffer(3, Some(&exit_buf.buffer), 0);
         encoder.set_buffer(4, Some(&convergence_buf.buffer), 0);
         
-        // Push constants via setBytes
         let push_constants = [num_blocks, bitset_words, effects_stride];
         encoder.set_bytes(
             5,
@@ -75,7 +70,6 @@ impl MetalDataflowEngine {
             &push_constants as *const _ as *const c_void,
         );
         
-        // Dispatch: use dispatchThreads for non-aligned grid sizes
         let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
         let threadgroup_size = metal::MTLSize::new(256, 1, 1);
         encoder.dispatch_threads(grid_size, threadgroup_size);
@@ -119,7 +113,7 @@ impl MetalDataflowEngine {
         );
         
         let grid_size = metal::MTLSize::new(num_blocks as u64, 1, 1);
-        let threadgroup_size = metal::MTLSize::new(256, 1, 1);
+        let threadgroup_size = metal::MTLSize::new(128, 1, 1);
         encoder.dispatch_threads(grid_size, threadgroup_size);
         
         encoder.end_encoding();

@@ -47,9 +47,9 @@ layout(set = 0, binding = 3) buffer ExitStatesFused {
     uint data[];
 } exit_states_fused;
 
-// Convergence flags: one uint per analysis
+// Convergence flags: packed into single uint (bits 0-3)
 layout(set = 0, binding = 4) buffer Convergence {
-    uint flags[4];
+    uint flags[1];
 } convergence;
 
 layout(push_constant) uniform PushConstants {
@@ -245,9 +245,11 @@ void main() {
         }
     }
 
-    // Set convergence flags individually so the CPU can detect per-analysis convergence
-    if (changed_dse) atomicOr(convergence.flags[0], 1u);
-    if (changed_copy) atomicOr(convergence.flags[1], 1u);
-    if (changed_const) atomicOr(convergence.flags[2], 1u);
-    if (changed_reach) atomicOr(convergence.flags[3], 1u);
+    // Pack convergence flags into single atomic to reduce contention
+    uint conv_flags = 0;
+    if (changed_dse) conv_flags |= 1u;
+    if (changed_copy) conv_flags |= 2u;
+    if (changed_const) conv_flags |= 4u;
+    if (changed_reach) conv_flags |= 8u;
+    if (conv_flags != 0) atomicOr(convergence.flags[0], conv_flags);
 }

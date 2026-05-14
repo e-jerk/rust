@@ -218,9 +218,13 @@ kernel void fused_mir_opt(
         }
     }
     
-    // Set convergence flags individually
-    if (changed_dse) atomic_fetch_or_explicit(&convergence[0], 1u, memory_order_relaxed);
-    if (changed_copy) atomic_fetch_or_explicit(&convergence[1], 1u, memory_order_relaxed);
-    if (changed_const) atomic_fetch_or_explicit(&convergence[2], 1u, memory_order_relaxed);
-    if (changed_reach) atomic_fetch_or_explicit(&convergence[3], 1u, memory_order_relaxed);
+    // Pack convergence flags into a single atomic to reduce contention
+    uint conv_flags = 0;
+    if (changed_dse) conv_flags |= 1u;
+    if (changed_copy) conv_flags |= 2u;
+    if (changed_const) conv_flags |= 4u;
+    if (changed_reach) conv_flags |= 8u;
+    if (conv_flags != 0) {
+        atomic_fetch_or_explicit(&convergence[0], conv_flags, memory_order_relaxed);
+    }
 }

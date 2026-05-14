@@ -91,7 +91,7 @@ fn main() {
     // Test 5: Dispatch Benchmark
     println!("\nTest 5: Fused Dispatch Benchmark");
     if let Some(path) = rustc_gpu_metal::load_fused_mir_opt_shader() {
-        if let Ok(engine) = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        if let Ok(mut engine) = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
             &backend.context,
             &path,
             "fused_mir_opt",
@@ -109,7 +109,7 @@ fn main() {
             let effects_buf = backend.create_buffer(effects_size).unwrap();
             let entry_buf = backend.create_buffer(state_size).unwrap();
             let exit_buf = backend.create_buffer(state_size).unwrap();
-            let convergence_buf = backend.create_buffer(4 * std::mem::size_of::<u32>() as u64).unwrap();
+            let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64).unwrap();
             
             // Initialize data
             let configs: Vec<u32> = (0..num_blocks).flat_map(|i| {
@@ -123,7 +123,7 @@ fn main() {
             let states: Vec<u32> = vec![0; num_blocks as usize * 320];
             entry_buf.write(&states);
             exit_buf.write(&states);
-            convergence_buf.write(&[0u32, 0, 0, 0]);
+            convergence_buf.write(&[0u32]);
             
             // Warmup
             for _ in 0..10 {
