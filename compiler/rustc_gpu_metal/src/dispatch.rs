@@ -2,6 +2,7 @@ use metal::ComputePipelineState;
 use crate::buffer::MetalBuffer;
 use crate::context::MetalContext;
 use std::os::raw::c_void;
+use std::sync::Arc;
 
 /// Metal dispatch engine for monomorphization and collection.
 ///
@@ -10,7 +11,7 @@ use std::os::raw::c_void;
 pub struct MetalDispatch {
     _device: metal::Device,
     queue: metal::CommandQueue,
-    pipeline: ComputePipelineState,
+    pipeline: Arc<ComputePipelineState>,
 }
 
 impl MetalDispatch {
@@ -32,7 +33,7 @@ impl MetalDispatch {
         Ok(MetalDispatch {
             _device: context.device.clone(),
             queue: context.queue.clone(),
-            pipeline,
+            pipeline: Arc::new(pipeline),
         })
     }
     

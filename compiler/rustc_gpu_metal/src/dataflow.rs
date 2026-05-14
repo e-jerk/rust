@@ -2,6 +2,7 @@ use metal::ComputePipelineState;
 use crate::buffer::MetalBuffer;
 use crate::context::MetalContext;
 use std::os::raw::c_void;
+use std::sync::Arc;
 
 /// Metal dataflow engine for fixed-point iteration.
 ///
@@ -14,7 +15,7 @@ use std::os::raw::c_void;
 pub struct MetalDataflowEngine {
     _device: metal::Device,
     queue: metal::CommandQueue,
-    pipeline: ComputePipelineState,
+    pipeline: Arc<ComputePipelineState>,
 }
 
 impl MetalDataflowEngine {
@@ -36,7 +37,7 @@ impl MetalDataflowEngine {
         Ok(MetalDataflowEngine {
             _device: context.device.clone(),
             queue: context.queue.clone(),
-            pipeline,
+            pipeline: Arc::new(pipeline),
         })
     }
     
