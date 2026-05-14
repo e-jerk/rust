@@ -1,0 +1,75 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Induction Variable Detection on GPU:
+// Identify loop variables that are incremented/decremented by a constant
+// amount each iteration.
+//
+// For each loop header block, analyze the loop body to find:
+// 1. Variables that are assigned in the loop
+// 2. The assignment is of the form: x = x + c (where c is constant)
+// 3. x is only modified at one place in the loop
+
+// Block info: [loop_header_flag, num_statements, stmt_0_local, stmt_0_kind, ...]
+layout(set = 0, binding = 0) readonly buffer BlockInfo {
+    uint data[];
+} block_info;
+
+// Induction variable output: for each block, bitmap of induction variables
+layout(set = 0, binding = 1) buffer InductionVars {
+    uint data[];
+} induction_vars;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint num_locals;
+    uint max_stmts_per_block;
+} pc;
+
+// Statement encoding:
+// kind: 0 = not induction, 1 = add constant, 2 = sub constant, 3 = other
+// local: the local being assigned
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+    
+    uint info_offset = block_idx * (2 + pc.max_stmts_per_block * 2);
+    bool is_loop_header = block_info.data[info_offset] != 0;
+    
+    if (!is_loop_header) return;
+    
+    uint num_stmts = block_info.data[info_offset + 1];
+    
+    // Track which locals are modified and how
+    uint modified_locals[128]; // local -> modification count
+    uint local_kinds[128];       // local -> kind of modification
+    for (uint i = 0; i < 128; i++) {
+        modified_locals[i] = 0;
+        local_kinds[i] = 0;
+    }
+    
+    // Analyze statements in this block
+    for (uint s = 0; s < num_stmts && s < pc.max_stmts_per_block; s++) {
+        uint stmt_offset = info_offset + 2 + s * 2;
+        uint local = block_info.data[stmt_offset];
+        uint kind = block_info.data[stmt_offset + 1];
+        
+        if (local < 128) {
+            modified_locals[local]++;
+            local_kinds[local] = kind;
+        }
+    }
+    
+    // Mark induction variables: modified exactly once with add/sub constant
+    for (uint local = 0; local < pc.num_locals && local < 128; local++) {
+        if (modified_locals[local] == 1 && (local_kinds[local] == 1 || local_kinds[local] == 2)) {
+            uint word = local / 32;
+            uint bit = local % 32;
+            if (word < (pc.num_locals + 31) / 32) {
+                atomicOr(induction_vars.data[block_idx * ((pc.num_locals + 31) / 32) + word], 1u << bit);
+            }
+        }
+    }
+}

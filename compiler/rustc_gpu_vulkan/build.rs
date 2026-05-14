@@ -91,4 +91,9 @@ fn main() {
         &out_dir,
         "GVN_SPV",
     );
+    compile_shader(
+        "src/shaders/induction_var.comp",
+        &out_dir,
+        "INDUCTION_VAR_SPV",
+    );
 }

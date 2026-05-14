@@ -1574,4 +1574,129 @@ impl<'tcx> GpuEngine<'tcx> {
         // Mix in block and stmt for uniqueness
         kind_hash.wrapping_mul(31).wrapping_add(block).wrapping_mul(17).wrapping_add(stmt)
     }
+
+    // ------------------------------------------------------------------
+    // GPU-accelerated Induction Variable Detection
+    // ------------------------------------------------------------------
+
+    /// Detect induction variables in loops on GPU.
+    ///
+    /// Returns a vector of (block, local) pairs indicating induction variables.
+    pub fn run_induction_var_detection(&self) -> Option<Vec<(BasicBlock, Local)>> {
+        if self.body.basic_blocks.len() < 30 {
+            return None;
+        }
+
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_induction_var_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let num_locals = self.body.local_decls.len();
+        let max_stmts = self
+            .body
+            .basic_blocks
+            .iter()
+            .map(|b| b.statements.len())
+            .max()
+            .unwrap_or(0);
+        let iv_words = (num_locals + 31) / 32;
+
+        // Detect loop headers first (simplified: blocks with >1 predecessors)
+        let mut loop_headers = vec![false; num_blocks];
+        for (block_idx, _) in self.body.basic_blocks.iter_enumerated() {
+            let preds = &self.body.basic_blocks.predecessors()[block_idx];
+            if preds.len() > 1 {
+                loop_headers[block_idx.index()] = true;
+            }
+        }
+
+        // Serialize block info: [is_loop_header, num_stmts, (local, kind) pairs]
+        let mut block_info = Vec::with_capacity(num_blocks * (2 + max_stmts * 2));
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            block_info.push(if loop_headers[block_idx.index()] { 1u32 } else { 0 });
+            let num_stmts = block.statements.len().min(max_stmts);
+            block_info.push(num_stmts as u32);
+
+            for stmt in &block.statements[..num_stmts] {
+                let (local, kind) = match &stmt.kind {
+                    StatementKind::Assign((place, rvalue)) => {
+                        let l = place.local;
+                        let k = match rvalue {
+                            rustc_middle::mir::Rvalue::BinaryOp(
+                                rustc_middle::mir::BinOp::Add,
+                                _,
+                            ) => 1u32,
+                            rustc_middle::mir::Rvalue::BinaryOp(
+                                rustc_middle::mir::BinOp::Sub,
+                                _,
+                            ) => 2u32,
+                            _ => 3u32,
+                        };
+                        (l.as_u32(), k)
+                    }
+                    _ => (0xFFFFFFFF, 0),
+                };
+                block_info.push(local);
+                block_info.push(kind);
+            }
+
+            // Pad remaining slots
+            for _ in num_stmts..max_stmts {
+                block_info.push(0xFFFFFFFF);
+                block_info.push(0);
+            }
+        }
+
+        let induction_vars: Vec<u32> = vec![0; num_blocks * iv_words];
+
+        let block_info_buf = backend
+            .create_buffer((block_info.len() * std::mem::size_of::<u32>()) as u64)?;
+        block_info_buf.write(&block_info);
+
+        let iv_buf = backend
+            .create_buffer((induction_vars.len() * std::mem::size_of::<u32>()) as u64)?;
+        iv_buf.write(&induction_vars);
+
+        // Single-pass induction variable detection
+        gpu.dispatch_induction_var_round(
+            &block_info_buf,
+            &iv_buf,
+            num_blocks as u32,
+            num_locals as u32,
+            max_stmts as u32,
+        )
+        .ok()?;
+
+        // Read back induction variables
+        let iv_data: Vec<u32> = iv_buf.read(num_blocks * iv_words);
+
+        let mut results = Vec::new();
+        for block_idx in 0..num_blocks {
+            if !loop_headers[block_idx] {
+                continue;
+            }
+            let start = block_idx * iv_words;
+            for word_idx in 0..iv_words {
+                let word = iv_data[start + word_idx];
+                if word == 0 {
+                    continue;
+                }
+                let base_local = word_idx * 32;
+                for bit in 0..32 {
+                    if word & (1u32 << bit) != 0 {
+                        let local_idx = base_local + bit;
+                        if local_idx < num_locals {
+                            results.push((
+                                BasicBlock::from_usize(block_idx),
+                                Local::from_usize(local_idx),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(results)
+    }
 }
