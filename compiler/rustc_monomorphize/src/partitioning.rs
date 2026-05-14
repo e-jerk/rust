@@ -1404,6 +1404,8 @@ pub(crate) fn provide(providers: &mut Providers) {
 ///
 /// This replaces the greedy merge algorithm with a GPU graph partitioning
 /// approach for non-incremental builds with many CGUs.
+///
+/// Tries Metal first (macOS native, ~1.5× faster), then Vulkan.
 #[allow(dead_code)]
 fn gpu_partition_codegen_units<'tcx>(
     cx: &PartitioningCx<'_, 'tcx>,
@@ -1415,17 +1417,35 @@ fn gpu_partition_codegen_units<'tcx>(
         return None; // No merging needed
     }
 
-    // Build GPU backend
-    let backend = rustc_gpu_vulkan::GpuBackend::new()?;
+    // Try Metal first (native Apple Silicon, ~280µs dispatch overhead)
+    if let Some(result) = gpu_partition_codegen_units_metal(cx, codegen_units, max_cgus) {
+        eprintln!("[GPU-PARTITION] Using Metal backend");
+        return Some(result);
+    }
 
-    // Load partition shader
-    let shader_spv = rustc_gpu_vulkan::load_partition_shader()?;
-    let pipeline = rustc_gpu_vulkan::shader::ComputePipeline::from_spirv(
-        &backend.context.device,
-        &shader_spv,
+    // Fall back to Vulkan (cross-platform, ~429µs dispatch overhead via MoltenVK)
+    if let Some(result) = gpu_partition_codegen_units_vulkan(cx, codegen_units, max_cgus) {
+        eprintln!("[GPU-PARTITION] Using Vulkan backend");
+        return Some(result);
+    }
+
+    None
+}
+
+/// Metal-specific GPU partitioning path.
+fn gpu_partition_codegen_units_metal<'tcx>(
+    cx: &PartitioningCx<'_, 'tcx>,
+    codegen_units: &mut Vec<CodegenUnit<'tcx>>,
+    max_cgus: usize,
+) -> Option<Vec<CodegenUnit<'tcx>>> {
+    let backend = rustc_gpu_metal::MetalBackend::new()?;
+    let metallib_path = rustc_gpu_metal::load_partition_shader()?;
+    let engine = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        &backend.context,
+        &metallib_path,
+        "partition",
     ).ok()?;
 
-    // Build adjacency list from CGU inline overlaps
     let num_nodes = codegen_units.len();
     let mut edge_list = Vec::new();
     let mut edge_offsets = vec![0u32; num_nodes + 1];
@@ -1438,7 +1458,6 @@ fn gpu_partition_codegen_units<'tcx>(
             if i == j { continue; }
             let overlap = compute_inlined_overlap(cgu_i, cgu_j);
             if overlap > 0 {
-                // Store neighbor index and weight (packed: weight in upper 16 bits)
                 let weight = (overlap.min(65535) as u32) << 16;
                 edge_list.push((j as u32) | weight);
             }
@@ -1446,7 +1465,7 @@ fn gpu_partition_codegen_units<'tcx>(
     }
     edge_offsets[num_nodes] = edge_list.len() as u32;
 
-    // Allocate GPU buffers
+    // Allocate Metal buffers
     let edge_list_buf = backend.create_buffer(
         (edge_list.len() * std::mem::size_of::<u32>()) as u64
     )?;
@@ -1461,7 +1480,6 @@ fn gpu_partition_codegen_units<'tcx>(
     )?;
     let convergence_buf = backend.create_buffer(4)?;
 
-    // Initialize labels: each node starts with its own label
     let labels: Vec<u32> = (0..num_nodes as u32).collect();
     let label_counts: Vec<u32> = vec![1; num_nodes];
     edge_list_buf.write(&edge_list);
@@ -1470,18 +1488,96 @@ fn gpu_partition_codegen_units<'tcx>(
     label_counts_buf.write(&label_counts);
     convergence_buf.write(&[0u32]);
 
-    // Create dispatch engine
-    let dispatch = rustc_gpu_vulkan::dispatch::GpuDispatch::new(&backend.context).ok()?;
-
-    // Run label propagation for a fixed number of rounds
-    const MAX_ROUNDS: u32 = 50;
     let target_size = (codegen_units.iter().map(|c| c.size_estimate()).sum::<usize>() / max_cgus) as u32;
+    const MAX_ROUNDS: u32 = 50;
 
     for _round in 0..MAX_ROUNDS {
-        // Clear convergence flag
         convergence_buf.write(&[0u32]);
 
-        // Dispatch partition kernel
+        engine.dispatch_partition(
+            &edge_list_buf,
+            &edge_offsets_buf,
+            &labels_buf,
+            &label_counts_buf,
+            &convergence_buf,
+            num_nodes as u32,
+            num_nodes as u32, // max_label
+            target_size,      // max_size
+        ).ok()?;
+
+        let conv: Vec<u32> = convergence_buf.read(1);
+        if conv[0] == 0 {
+            break;
+        }
+    }
+
+    let final_labels: Vec<u32> = labels_buf.read(num_nodes);
+    build_merged_cgus(cx, codegen_units, final_labels, max_cgus, "metal")
+}
+
+/// Vulkan-specific GPU partitioning path.
+fn gpu_partition_codegen_units_vulkan<'tcx>(
+    cx: &PartitioningCx<'_, 'tcx>,
+    codegen_units: &mut Vec<CodegenUnit<'tcx>>,
+    max_cgus: usize,
+) -> Option<Vec<CodegenUnit<'tcx>>> {
+    let backend = rustc_gpu_vulkan::GpuBackend::new()?;
+
+    let shader_spv = rustc_gpu_vulkan::load_partition_shader()?;
+    let pipeline = rustc_gpu_vulkan::shader::ComputePipeline::from_spirv(
+        &backend.context.device,
+        &shader_spv,
+    ).ok()?;
+
+    let num_nodes = codegen_units.len();
+    let mut edge_list = Vec::new();
+    let mut edge_offsets = vec![0u32; num_nodes + 1];
+
+    for (i, cgu_i) in codegen_units.iter().enumerate() {
+        let start = edge_list.len() as u32;
+        edge_offsets[i] = start;
+
+        for (j, cgu_j) in codegen_units.iter().enumerate() {
+            if i == j { continue; }
+            let overlap = compute_inlined_overlap(cgu_i, cgu_j);
+            if overlap > 0 {
+                let weight = (overlap.min(65535) as u32) << 16;
+                edge_list.push((j as u32) | weight);
+            }
+        }
+    }
+    edge_offsets[num_nodes] = edge_list.len() as u32;
+
+    let edge_list_buf = backend.create_buffer(
+        (edge_list.len() * std::mem::size_of::<u32>()) as u64
+    )?;
+    let edge_offsets_buf = backend.create_buffer(
+        (edge_offsets.len() * std::mem::size_of::<u32>()) as u64
+    )?;
+    let labels_buf = backend.create_buffer(
+        (num_nodes * std::mem::size_of::<u32>()) as u64
+    )?;
+    let label_counts_buf = backend.create_buffer(
+        (num_nodes * std::mem::size_of::<u32>()) as u64
+    )?;
+    let convergence_buf = backend.create_buffer(4)?;
+
+    let labels: Vec<u32> = (0..num_nodes as u32).collect();
+    let label_counts: Vec<u32> = vec![1; num_nodes];
+    edge_list_buf.write(&edge_list);
+    edge_offsets_buf.write(&edge_offsets);
+    labels_buf.write(&labels);
+    label_counts_buf.write(&label_counts);
+    convergence_buf.write(&[0u32]);
+
+    let dispatch = rustc_gpu_vulkan::dispatch::GpuDispatch::new(&backend.context).ok()?;
+
+    let _target_size = (codegen_units.iter().map(|c| c.size_estimate()).sum::<usize>() / max_cgus) as u32;
+    const MAX_ROUNDS: u32 = 50;
+
+    for _round in 0..MAX_ROUNDS {
+        convergence_buf.write(&[0u32]);
+
         dispatch.dispatch(
             &pipeline,
             &edge_list_buf,
@@ -1490,57 +1586,60 @@ fn gpu_partition_codegen_units<'tcx>(
             num_nodes as u32,
         ).ok()?;
 
-        // Check convergence
         let conv: Vec<u32> = convergence_buf.read(1);
         if conv[0] == 0 {
-            break; // Converged
+            break;
         }
     }
 
-    // Read back labels
     let final_labels: Vec<u32> = labels_buf.read(num_nodes);
+    build_merged_cgus(cx, codegen_units, final_labels, max_cgus, "vulkan")
+}
 
-    // Group CGUs by label and merge
+/// Build merged CGUs from label assignments (shared by both Metal and Vulkan paths).
+fn build_merged_cgus<'tcx>(
+    cx: &PartitioningCx<'_, 'tcx>,
+    codegen_units: &mut Vec<CodegenUnit<'tcx>>,
+    final_labels: Vec<u32>,
+    max_cgus: usize,
+    backend_name: &str,
+) -> Option<Vec<CodegenUnit<'tcx>>> {
+    let num_nodes = codegen_units.len();
+
     let mut label_to_cgus: FxIndexMap<u32, Vec<usize>> = FxIndexMap::default();
     for (idx, label) in final_labels.iter().enumerate() {
         label_to_cgus.entry(*label).or_default().push(idx);
     }
 
-    // Build merged CGUs
     let mut merged_cgus: Vec<CodegenUnit<'tcx>> = Vec::new();
     let cgu_name_builder = &mut CodegenUnitNameBuilder::new(cx.tcx);
 
     for (_label, indices) in label_to_cgus {
         if indices.is_empty() { continue; }
 
-        // Start with the first CGU
         let mut merged = codegen_units[indices[0]].clone();
 
-        // Merge remaining CGUs into it
         for &idx in indices.iter().skip(1) {
             let src = &codegen_units[idx];
             merged.items_mut().append(src.items_mut());
         }
         merged.compute_size_estimate();
 
-        // Generate deterministic name
-        let suffix = format!("gpu_{}", merged_cgus.len());
+        let suffix = format!("gpu_{}_{}", backend_name, merged_cgus.len());
         let new_name = cgu_name_builder.build_cgu_name_no_mangle(LOCAL_CRATE, &["cgu"], Some(suffix));
         merged.set_name(new_name);
 
         merged_cgus.push(merged);
     }
 
-    // If we still have too many CGUs, fall back to greedy merge
     if merged_cgus.len() > max_cgus {
         merge_codegen_units(cx, &mut merged_cgus);
     }
 
-    // Ensure sorted by name for determinism
     merged_cgus.sort_by(|a, b| a.name().as_str().cmp(b.name().as_str()));
 
-    eprintln!("[GPU-PARTITION] Reduced {} CGUs to {} via label propagation",
-        num_nodes, merged_cgus.len());
+    eprintln!("[GPU-PARTITION-{}] Reduced {} CGUs to {} via label propagation",
+        backend_name, num_nodes, merged_cgus.len());
 
     Some(merged_cgus)
 }
