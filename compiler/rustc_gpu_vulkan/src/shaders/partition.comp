@@ -1,0 +1,107 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Improved graph partitioning for codegen units.
+// Uses label propagation with proper edge indexing.
+//
+// Memory layout:
+// edges: [dst_0, dst_1, ...] sorted by source
+// edge_offsets: [offset_for_node_0, offset_for_node_1, ...]
+// labels: current partition assignment
+// label_counts: size of each partition
+//
+// Algorithm:
+// 1. Each node examines its neighbors' labels
+// 2. Adopts the most common label among neighbors
+// 3. If that partition is full, stays in current partition
+
+layout(set = 0, binding = 0) readonly buffer EdgeList {
+    uint data[];
+} edge_list;
+
+layout(set = 0, binding = 1) readonly buffer EdgeOffsets {
+    uint data[];
+} edge_offsets;
+
+layout(set = 0, binding = 2) buffer Labels {
+    uint data[];
+} labels;
+
+layout(set = 0, binding = 3) buffer LabelCounts {
+    uint data[];
+} label_counts;
+
+layout(set = 0, binding = 4) buffer Convergence {
+    uint changed;
+} convergence;
+
+layout(push_constant) uniform PushConstants {
+    uint num_nodes;
+    uint max_label;
+    uint max_size;
+} pc;
+
+void main() {
+    uint node_idx = gl_GlobalInvocationID.x;
+    if (node_idx >= pc.num_nodes) return;
+    
+    uint current_label = labels.data[node_idx];
+    
+    // Get edge range for this node
+    uint start = edge_offsets.data[node_idx];
+    uint end = (node_idx + 1 < pc.num_nodes) ? edge_offsets.data[node_idx + 1] : pc.num_nodes;
+    
+    // Count neighbor labels using a small local histogram
+    // We only track the top few labels to save memory
+    uint neighbor_labels[8];  // Track up to 8 distinct labels
+    uint neighbor_counts[8];
+    uint distinct = 0;
+    
+    for (uint e = start; e < end; e++) {
+        uint neighbor = edge_list.data[e];
+        if (neighbor >= pc.num_nodes) continue;
+        
+        uint neighbor_label = labels.data[neighbor];
+        
+        // Find or insert in histogram
+        bool found = false;
+        for (uint i = 0; i < distinct && i < 8; i++) {
+            if (neighbor_labels[i] == neighbor_label) {
+                neighbor_counts[i]++;
+                found = true;
+                break;
+            }
+        }
+        if (!found && distinct < 8) {
+            neighbor_labels[distinct] = neighbor_label;
+            neighbor_counts[distinct] = 1;
+            distinct++;
+        }
+    }
+    
+    // Find best label (most common among neighbors)
+    uint best_label = current_label;
+    uint best_count = 0;
+    
+    for (uint i = 0; i < distinct; i++) {
+        if (neighbor_counts[i] > best_count) {
+            best_count = neighbor_counts[i];
+            best_label = neighbor_labels[i];
+        }
+    }
+    
+    // Only change if:
+    // 1. Best label is different from current
+    // 2. Best label's partition isn't full
+    // 3. Moving improves locality (at least 2 neighbors have this label)
+    if (best_label != current_label && best_count >= 2) {
+        uint new_size = label_counts.data[best_label];
+        if (new_size < pc.max_size) {
+            labels.data[node_idx] = best_label;
+            atomicAdd(label_counts.data[best_label], 1);
+            atomicSub(label_counts.data[current_label], 1);
+            atomicOr(convergence.changed, 1);
+        }
+    }
+}

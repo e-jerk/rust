@@ -111,4 +111,9 @@ fn main() {
         &out_dir,
         "BORROW_CHECK_SPV",
     );
+    compile_shader(
+        "src/shaders/partition.comp",
+        &out_dir,
+        "PARTITION_SPV",
+    );
 }

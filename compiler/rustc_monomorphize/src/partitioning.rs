@@ -1357,3 +1357,34 @@ pub(crate) fn provide(providers: &mut Providers) {
 
     collector::provide(providers);
 }
+
+// ------------------------------------------------------------------
+// GPU-accelerated codegen unit partitioning
+// ------------------------------------------------------------------
+
+/// Build a graph from the usage map and run GPU-accelerated label propagation
+/// to find better codegen unit partitions.
+///
+/// This is an experimental optimization that replaces the greedy merge algorithm
+/// with a GPU graph partitioning approach for crates with many codegen units.
+#[allow(dead_code)]
+fn gpu_partition_codegen_units<'tcx>(
+    _cx: &PartitioningCx<'_, 'tcx>,
+    _mono_items: &[MonoItem<'tcx>],
+    _usage_map: &UsageMap<'tcx>,
+    _max_cgus: usize,
+) -> Option<Vec<CodegenUnit<'tcx>>> {
+    // This is a placeholder for the full GPU partitioning implementation.
+    // The algorithm would:
+    // 1. Build an adjacency list from the usage map
+    // 2. Serialize it to GPU buffers
+    // 3. Run label propagation on GPU
+    // 4. Read back partition assignments
+    // 5. Build CodegenUnits from the assignments
+    //
+    // Currently disabled because:
+    // - The existing source-based partitioning is better for incremental builds
+    // - GPU partitioning only makes sense for non-incremental builds with many CGUs
+    // - Integration requires significant changes to the partitioning pipeline
+    None
+}
