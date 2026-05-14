@@ -382,6 +382,9 @@ fn gpu_collect_mono_items_vulkan<'tcx>(
     // Pipelined processing: prepare next batch while GPU works on current
     let mut pending_gpu = false;
     let mut next_batch: Option<(Vec<MonoItem<'tcx>>, SerializedBatch<'tcx>)> = None;
+    
+    // Create dispatch once, reuse across all dispatches
+    let dispatch = rustc_gpu_vulkan::dispatch::GpuDispatch::new(&backend.context).ok()?;
 
     while !queue.is_empty() || pending_gpu {
         rounds += 1;
@@ -443,7 +446,6 @@ fn gpu_collect_mono_items_vulkan<'tcx>(
             persistent_bufs.offsets_buf.write(&serialized.body_offsets);
             persistent_bufs.reset_counter();
 
-            let dispatch = rustc_gpu_vulkan::dispatch::GpuDispatch::new(&backend.context).ok()?;
             dispatch.dispatch_with_counter(
                 &pipeline,
                 &persistent_bufs.actions_buf,
