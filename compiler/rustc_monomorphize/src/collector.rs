@@ -267,7 +267,7 @@ pub(crate) struct UsageMap<'tcx> {
 }
 
 impl<'tcx> UsageMap<'tcx> {
-    fn new() -> UsageMap<'tcx> {
+    pub(crate) fn new() -> UsageMap<'tcx> {
         UsageMap { used_map: Default::default(), user_map: Default::default() }
     }
 
@@ -280,6 +280,12 @@ impl<'tcx> UsageMap<'tcx> {
         }
 
         assert!(self.used_map.insert(user_item, used_items.items().collect()).is_none());
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_usage(&mut self, source: MonoItem<'tcx>, target: MonoItem<'tcx>) {
+        self.user_map.entry(target).or_default().push(source);
+        self.used_map.entry(source).or_default().push(target);
     }
 
     pub(crate) fn get_user_items(&self, item: MonoItem<'tcx>) -> &[MonoItem<'tcx>] {

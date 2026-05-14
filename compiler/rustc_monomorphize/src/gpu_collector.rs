@@ -1,11 +1,18 @@
 #![allow(unused_imports, dead_code, unreachable_pub)]
 
+use std::collections::VecDeque;
+
 use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::unord::UnordSet;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::{self, visit::Visitor, CastKind, Rvalue, TerminatorKind};
 use rustc_middle::mono::MonoItem;
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::{self, GenericArgsRef, Instance, Ty, TyCtxt};
+
+use crate::collector::UsageMap;
+
+const GPU_BATCH_SIZE: usize = 1024;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -198,4 +205,103 @@ pub fn resolve_edge<'tcx>(
     let args = batch.generic_args_table.get(edge.args_idx as usize)?;
 
     Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), def_id, *args).ok().flatten()
+}
+
+#[cfg(feature = "rustc_gpu_vulkan")]
+pub fn gpu_collect_mono_items<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    roots: Vec<MonoItem<'tcx>>,
+) -> Option<(Vec<MonoItem<'tcx>>, UsageMap<'tcx>)> {
+    let backend = rustc_gpu_vulkan::GpuBackend::new()?;
+    let pipeline = {
+        let spirv = rustc_gpu_vulkan::load_mono_collect_shader()?;
+        rustc_gpu_vulkan::shader::ComputePipeline::from_spirv(
+            &backend.context.device,
+            &spirv,
+        ).ok()?
+    };
+
+    let mut visited = UnordSet::default();
+    let mut queue = VecDeque::from(roots);
+    let mut usage_map = UsageMap::new();
+
+    while !queue.is_empty() {
+        let batch_size = GPU_BATCH_SIZE.min(queue.len());
+        let batch: Vec<_> = queue.drain(..batch_size).collect();
+
+        // Serialize
+        let serialized = serialize_batch(tcx, &batch);
+
+        // Allocate GPU buffers
+        let device = &backend.context.device;
+        let physical_device = unsafe {
+            backend.context.instance.enumerate_physical_devices().ok()?[0]
+        };
+
+        let actions_buf = rustc_gpu_vulkan::buffer::GpuBuffer::new_host_visible(
+            device, physical_device, &backend.context.instance,
+            (serialized.actions.len() * std::mem::size_of::<GpuMonoAction>()) as u64,
+        ).ok()?;
+        actions_buf.write(&serialized.actions);
+
+        let offsets_buf = rustc_gpu_vulkan::buffer::GpuBuffer::new_host_visible(
+            device, physical_device, &backend.context.instance,
+            (serialized.body_offsets.len() * std::mem::size_of::<u32>()) as u64,
+        ).ok()?;
+        offsets_buf.write(&serialized.body_offsets);
+
+        let max_edges = serialized.actions.len(); // worst case
+        let edges_buf = rustc_gpu_vulkan::buffer::GpuBuffer::new_host_visible(
+            device, physical_device, &backend.context.instance,
+            (max_edges * std::mem::size_of::<GpuEdge>()) as u64,
+        ).ok()?;
+
+        // Dispatch
+        let dispatch = rustc_gpu_vulkan::dispatch::GpuDispatch::new(&backend.context);
+        dispatch.dispatch(
+            &pipeline,
+            &actions_buf,
+            &offsets_buf,
+            &edges_buf,
+            serialized.instances.len() as u32,
+        ).ok()?;
+
+        // Read back
+        let edges = edges_buf.read::<GpuEdge>(max_edges);
+        // Note: we need to read the atomic counter too, but for MVP we can use edges.len()
+        // In practice, the GPU writes edges sequentially and we need to know how many were written
+        // For now, we'll read all and filter by def_id != 0
+
+        // Resolve edges on CPU
+        for edge in &edges {
+            if edge.def_id_krate == 0 && edge.def_id_index == 0 {
+                continue; // skip empty slots
+            }
+            if let Some(instance) = resolve_edge(tcx, *edge, &serialized) {
+                let mono_item = MonoItem::Fn(instance);
+                let source_idx = edge.source_idx as usize;
+                if source_idx < batch.len() {
+                    let source_item = batch[source_idx];
+                    usage_map.record_usage(source_item, mono_item);
+                }
+
+                if visited.insert(mono_item) {
+                    queue.push_back(mono_item);
+                }
+            }
+        }
+    }
+
+    let mono_items = tcx.with_stable_hashing_context(|mut hcx| {
+        visited.into_sorted(&mut hcx, true)
+    });
+    Some((mono_items, usage_map))
+}
+
+#[cfg(not(feature = "rustc_gpu_vulkan"))]
+pub fn gpu_collect_mono_items<'tcx>(
+    _tcx: TyCtxt<'tcx>,
+    _roots: Vec<MonoItem<'tcx>>,
+) -> Option<(Vec<MonoItem<'tcx>>, UsageMap<'tcx>)> {
+    None
 }
