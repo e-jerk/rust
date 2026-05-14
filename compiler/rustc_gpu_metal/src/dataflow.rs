@@ -40,6 +40,18 @@ impl MetalDataflowEngine {
         })
     }
     
+    /// Create from a cached pipeline (avoids recompiling the shader).
+    pub fn from_pipeline(
+        context: &MetalContext,
+        pipeline: Arc<metal::ComputePipelineState>,
+    ) -> Self {
+        MetalDataflowEngine {
+            _device: context.device.clone(),
+            queue: context.queue.clone(),
+            pipeline,
+        }
+    }
+    
     /// Dispatch a batch of dataflow rounds in a single command buffer.
     ///
     /// Each tuple is (config, effects, entry, exit, convergence, num_blocks, bitset_words, effects_stride).

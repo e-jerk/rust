@@ -36,6 +36,18 @@ impl MetalDispatch {
         })
     }
     
+    /// Create from a cached pipeline.
+    pub fn from_pipeline(
+        context: &MetalContext,
+        pipeline: Arc<metal::ComputePipelineState>,
+    ) -> Self {
+        MetalDispatch {
+            _device: context.device.clone(),
+            queue: context.queue.clone(),
+            pipeline,
+        }
+    }
+    
     pub fn dispatch(
         &self,
         actions_buf: &MetalBuffer,

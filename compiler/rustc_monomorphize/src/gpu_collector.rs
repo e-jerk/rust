@@ -211,11 +211,11 @@ fn gpu_collect_mono_items_metal<'tcx>(
 ) -> Option<(Vec<MonoItem<'tcx>>, UsageMap<'tcx>)> {
     let backend = rustc_gpu_metal::MetalBackend::new()?;
     let metallib_path = rustc_gpu_metal::load_mono_collect_shader()?;
-    let dispatch = rustc_gpu_metal::dispatch::MetalDispatch::new(
+    let pipeline = backend.get_pipeline(&metallib_path, "mono_collect")?;
+    let dispatch = rustc_gpu_metal::dispatch::MetalDispatch::from_pipeline(
         &backend.context,
-        &metallib_path,
-        "mono_collect",
-    ).ok()?;
+        pipeline,
+    );
 
     let mut visited = UnordSet::default();
     let mut queue = VecDeque::from(roots);

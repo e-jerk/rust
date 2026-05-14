@@ -50,11 +50,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_forward_live_locals_metal(&self) -> Option<Vec<DenseBitSet<Local>>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_dataflow_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "dataflow")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "dataflow",
-        ).ok()?;
+            pipeline,
+        );
 
         let num_blocks = self.body.basic_blocks.len();
         let num_locals = self.body.local_decls.len();
@@ -343,11 +343,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_backward_liveness_for_dse_metal(&self) -> Option<Vec<(BasicBlock, usize)>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_dead_store_elim_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "dead_store_elim")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "dead_store_elim",
-        ).ok()?;
+            pipeline,
+        );
 
         let num_blocks = self.body.basic_blocks.len();
         let num_locals = self.body.local_decls.len();
@@ -671,11 +671,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_copy_propagation_metal(&self) -> Option<Vec<(BasicBlock, usize, Local, Local)>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_copy_prop_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "copy_prop")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "copy_prop",
-        ).ok()?;
+            pipeline,
+        );
 
         let num_blocks = self.body.basic_blocks.len();
         let num_locals = self.body.local_decls.len();
@@ -955,11 +955,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_constant_propagation_metal(&self) -> Option<Vec<(BasicBlock, usize, Local, u32)>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_const_prop_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "const_prop")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "const_prop",
-        ).ok()?;
+            pipeline,
+        );
 
         let num_blocks = self.body.basic_blocks.len();
         let num_locals = self.body.local_decls.len();
@@ -1248,11 +1248,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_reaching_definitions_metal(&self) -> Option<Vec<(BasicBlock, usize, Local, u32)>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_reaching_defs_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "reaching_defs")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "reaching_defs",
-        ).ok()?;
+            pipeline,
+        );
 
         let num_blocks = self.body.basic_blocks.len();
         let _num_locals = self.body.local_decls.len();
@@ -1481,11 +1481,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_ssa_construction_metal(&self) -> Option<Vec<(BasicBlock, Local)>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_ssa_construct_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "ssa_construct")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "ssa_construct",
-        ).ok()?;
+            pipeline,
+        );
 
         let num_blocks = self.body.basic_blocks.len();
         let num_locals = self.body.local_decls.len();
@@ -1685,11 +1685,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_alias_analysis_metal(&self) -> Option<Vec<Vec<bool>>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_alias_analysis_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "alias_analysis")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "alias_analysis",
-        ).ok()?;
+            pipeline,
+        );
 
         let mut accesses = Vec::new();
         for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
@@ -1880,11 +1880,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_dominance_analysis_metal(&self) -> Option<Vec<DenseBitSet<BasicBlock>>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_dominance_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "dominance")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "dominance",
-        ).ok()?;
+            pipeline,
+        );
 
         let num_blocks = self.body.basic_blocks.len();
         let bitmap_words = (num_blocks + 31) / 32;
@@ -2093,11 +2093,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_loop_detection_metal(&self) -> Option<Vec<BasicBlock>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_loop_detect_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "loop_detect")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "loop_detect",
-        ).ok()?;
+            pipeline,
+        );
 
         let num_blocks = self.body.basic_blocks.len();
         let matrix_words = (num_blocks + 31) / 32;
@@ -2234,11 +2234,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_gvn_metal(&self) -> Option<Vec<(BasicBlock, usize, u32)>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_gvn_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "gvn")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "gvn",
-        ).ok()?;
+            pipeline,
+        );
 
         let num_blocks = self.body.basic_blocks.len();
         let max_statements = self
@@ -2401,11 +2401,11 @@ impl<'tcx> GpuEngine<'tcx> {
     fn run_induction_var_detection_metal(&self) -> Option<Vec<(BasicBlock, Local)>> {
         let backend = rustc_gpu_metal::MetalBackend::new()?;
         let metallib_path = rustc_gpu_metal::load_induction_var_shader()?;
-        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+        let pipeline = backend.get_pipeline(&metallib_path, "induction_var")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
             &backend.context,
-            &metallib_path,
-            "induction_var",
-        ).ok()?;
+            pipeline,
+        );
 
         let num_blocks = self.body.basic_blocks.len();
         let num_locals = self.body.local_decls.len();

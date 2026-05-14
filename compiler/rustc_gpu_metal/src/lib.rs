@@ -4,6 +4,7 @@ pub mod dataflow;
 pub mod dispatch;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 thread_local! {
@@ -12,14 +13,17 @@ thread_local! {
 
 /// Feature-gated Metal GPU backend. Returns None if Metal unavailable.
 /// Uses thread-local caching to avoid recreating the device/context per call.
+/// Also caches compute pipelines to avoid repeated compilation.
 pub struct MetalBackend {
     pub context: Arc<context::MetalContext>,
+    pipeline_cache: RefCell<HashMap<(String, String), Arc<metal::ComputePipelineState>>>,
 }
 
 impl Clone for MetalBackend {
     fn clone(&self) -> Self {
         MetalBackend {
             context: Arc::clone(&self.context),
+            pipeline_cache: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -36,11 +40,37 @@ impl MetalBackend {
 
     fn create() -> Option<Self> {
         let context = context::MetalContext::new().ok()?;
-        Some(MetalBackend { context: Arc::new(context) })
+        Some(MetalBackend {
+            context: Arc::new(context),
+            pipeline_cache: RefCell::new(HashMap::new()),
+        })
     }
 
     pub fn create_buffer(&self, size: u64) -> Option<buffer::MetalBuffer> {
         buffer::MetalBuffer::new(&self.context.device, size)
+    }
+
+    /// Get or create a cached compute pipeline for the given shader.
+    pub fn get_pipeline(
+        &self,
+        metallib_path: &str,
+        function_name: &str,
+    ) -> Option<Arc<metal::ComputePipelineState>> {
+        let key = (metallib_path.to_string(), function_name.to_string());
+        {
+            let cache = self.pipeline_cache.borrow();
+            if let Some(pipeline) = cache.get(&key) {
+                return Some(Arc::clone(pipeline));
+            }
+        }
+        let library = self.context.device.new_library_with_file(metallib_path).ok()?;
+        let function = library.get_function(function_name, None).ok()?;
+        let pipeline = self.context.device
+            .new_compute_pipeline_state_with_function(&function)
+            .ok()?;
+        let pipeline = Arc::new(pipeline);
+        self.pipeline_cache.borrow_mut().insert(key, Arc::clone(&pipeline));
+        Some(pipeline)
     }
 }
 
