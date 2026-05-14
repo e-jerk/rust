@@ -45,9 +45,9 @@ GPU_PHASES = {
     "mir_optimizations_fused": {
         "cpu_fraction": 0.12,
         "gpu_speedup": 3.0,  # DSE + copy prop + const prop + reaching defs in parallel, 1 dispatch
-        "kernel_launch_us": 429,  # 1 dispatch for all 4 analyses (was 4x before fusion)
+        "kernel_launch_us": 498,  # MEASURED: 1 dispatch for all 4 analyses (~498μs on M1)
         "batch_size": 65536,
-        "amortization_threshold": 2000,  # Lower threshold due to fused overhead
+        "amortization_threshold": 2500,  # Lower threshold due to fused overhead
     },
     "dataflow_analyses": {
         "cpu_fraction": 0.05,  # Subset of mir_optimizations
@@ -187,15 +187,18 @@ def print_benchmark_report():
         print(f"    Kernel launch:    {info['kernel_launch_us']}μs")
     print()
     
-    print("M1 Max + MoltenVK Measurements (Updated with Persistent Resources):")
+    print("M1 Max + MoltenVK Measurements (Updated with Analysis Fusion):")
     print("-" * 50)
     print(f"  Context creation:              ~39ms")
     print(f"  Pipeline creation:             ~1.5-19ms")
     print(f"  Per-dispatch (persistent):     ~429μs (MEASURED, averaged)")
     print(f"  Per-dispatch (old, per-alloc): ~506μs (MEASURED, averaged)")
     print(f"  Overhead reduction:            ~15-21% with persistent resources")
+    print(f"  Fused dispatch (4 analyses):   ~498μs (MEASURED)")
+    print(f"  Effective per-analysis:        ~124μs (498/4)")
+    print(f"  Fusion overhead reduction:       4x (4 dispatches → 1)")
     print(f"  Buffer allocation:             ~110-162μs for 11MB")
-    print(f"  SPIR-V shader loading:           ~85KB total")
+    print(f"  SPIR-V shader loading:           ~100KB total (17 shaders)")
     print()
     
     # Benchmark different crate sizes

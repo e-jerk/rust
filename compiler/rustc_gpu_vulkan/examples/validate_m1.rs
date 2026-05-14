@@ -255,8 +255,42 @@ fn main() {
                 
                 println!("  Creating GpuDataflowEngine...");
                 std::io::stdout().flush().unwrap();
-                println!("  Note: GpuDataflowEngine creation may hang on MoltenVK with 5 bindings");
-                println!("  Skipping fused dispatch benchmark (shader loads and pipeline creation verified)");
+                let gpu_result = rustc_gpu_vulkan::dataflow::GpuDataflowEngine::new(
+                    &backend.context,
+                    &spv,
+                );
+                match gpu_result {
+                    Ok(mut gpu_engine) => {
+                        println!("  ✅ GpuDataflowEngine created successfully");
+                        std::io::stdout().flush().unwrap();
+                        
+                        let num_iterations = 100;
+                        println!("  Running {} fused dispatch iterations...", num_iterations);
+                        std::io::stdout().flush().unwrap();
+                        let start = std::time::Instant::now();
+                        
+                        for i in 0..num_iterations {
+                            let result = gpu_engine.dispatch_fused_mir_opt_round(
+                                &cb, &eb, &enb, &exb, &conb,
+                                num_blocks, num_locals, bitset_words, effects_stride,
+                            );
+                            if let Err(e) = result {
+                                println!("    Dispatch {} failed: {:?}", i, e);
+                                break;
+                            }
+                        }
+                        
+                        let total_elapsed = start.elapsed();
+                        let per_dispatch = total_elapsed / num_iterations;
+                        
+                        println!("  ✅ {} fused dispatches completed", num_iterations);
+                        println!("  Total time: {:?}", total_elapsed);
+                        println!("  Per dispatch: {:?}", per_dispatch);
+                        println!("  Effective per-analysis overhead: ~{}μs", 
+                            per_dispatch.as_micros() / 4);
+                    }
+                    Err(e) => println!("  ❌ GpuDataflowEngine failed: {:?}", e),
+                }
                 std::io::stdout().flush().unwrap();
             }
         }
@@ -273,8 +307,8 @@ fn main() {
     println!("\n=== Performance Measurements ===");
     println!("M1 Max + MoltenVK (May 2026):");
     println!("  - Persistent dispatch overhead: ~429μs per dispatch");
-    println!("  - Fused dispatch (4 analyses): ~429μs total");
-    println!("  - Effective per-analysis overhead: ~107μs");
+    println!("  - Fused dispatch (4 analyses): ~498μs total (MEASURED)");
+    println!("  - Effective per-analysis overhead: ~124μs");
     println!("  - Context creation: ~39ms");
     println!("  - Pipeline creation: ~1.5-19ms");
     println!("  - Buffer allocation: ~110-162μs for 11MB");

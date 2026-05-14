@@ -161,17 +161,12 @@ impl<'ctx> GpuDataflowEngine<'ctx> {
             device.allocate_command_buffers(&alloc_info)?[0]
         };
 
-        // Create persistent fence
         let fence = unsafe {
             device.create_fence(
                 &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
                 None,
             )?
         };
-
-        unsafe {
-            device.destroy_shader_module(shader_module, None);
-        }
 
         Ok(GpuDataflowEngine {
             context,
