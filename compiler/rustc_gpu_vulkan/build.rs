@@ -86,4 +86,9 @@ fn main() {
         &out_dir,
         "LOOP_DETECT_SPV",
     );
+    compile_shader(
+        "src/shaders/gvn.comp",
+        &out_dir,
+        "GVN_SPV",
+    );
 }

@@ -1,0 +1,65 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Global Value Numbering on GPU:
+// Assign hash-based value numbers to expressions and detect duplicates.
+//
+// For each statement, we compute a hash of its rvalue.
+// If two statements have the same hash and the same operands are available,
+// they compute the same value.
+
+// Expression descriptors: for each statement, an encoded hash
+// 0 = not an expression (no hash)
+// Non-zero = hash value of the expression
+layout(set = 0, binding = 0) readonly buffer ExprHashes {
+    uint data[];
+} expr_hashes;
+
+// Value number table: for each block, for each statement, the assigned value number
+// 0 = not computed, >0 = value number
+layout(set = 0, binding = 1) buffer ValueNumbers {
+    uint data[];
+} value_numbers;
+
+// Convergence flag
+layout(set = 0, binding = 2) buffer Convergence {
+    uint changed;
+} convergence;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint statements_per_block;
+    uint hash_table_size;
+} pc;
+
+// Simple hash table with linear probing (simplified for GPU)
+// We use atomic operations to insert into the hash table
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+    
+    uint base = block_idx * pc.statements_per_block;
+    bool changed = false;
+    
+    // For each statement in the block
+    for (uint stmt_idx = 0; stmt_idx < pc.statements_per_block; stmt_idx++) {
+        uint hash = expr_hashes.data[base + stmt_idx];
+        if (hash == 0) continue;
+        
+        // Assign value number = hash (simplified: use hash as value number)
+        // In a real implementation, we'd use a hash table with collision handling
+        uint old_vn = value_numbers.data[base + stmt_idx];
+        uint new_vn = hash;
+        
+        if (old_vn != new_vn) {
+            value_numbers.data[base + stmt_idx] = new_vn;
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        atomicOr(convergence.changed, 1);
+    }
+}

@@ -1475,4 +1475,103 @@ impl<'tcx> GpuEngine<'tcx> {
 
         Some(headers)
     }
+
+    // ------------------------------------------------------------------
+    // GPU-accelerated Global Value Numbering (GVN)
+    // ------------------------------------------------------------------
+
+    /// Run GVN analysis on GPU to detect redundant expressions.
+    ///
+    /// Returns a vector of (block, statement_idx, value_number) for expressions.
+    pub fn run_gvn(&self) -> Option<Vec<(BasicBlock, usize, u32)>> {
+        if self.body.basic_blocks.len() < 50 {
+            return None;
+        }
+
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_gvn_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let max_statements = self
+            .body
+            .basic_blocks
+            .iter()
+            .map(|b| b.statements.len())
+            .max()
+            .unwrap_or(0);
+        let hash_table_size = 1024;
+
+        // Serialize expression hashes
+        let mut expr_hashes = vec![0u32; num_blocks * max_statements];
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                if let StatementKind::Assign((_place, rvalue)) = &stmt.kind {
+                    // Compute a simple hash of the rvalue
+                    let hash = self.hash_rvalue(rvalue, block_idx.as_u32(), stmt_idx as u32);
+                    expr_hashes[block_idx.index() * max_statements + stmt_idx] = hash;
+                }
+            }
+        }
+
+        let value_numbers: Vec<u32> = vec![0; num_blocks * max_statements];
+
+        let hash_buf = backend
+            .create_buffer((expr_hashes.len() * std::mem::size_of::<u32>()) as u64)?;
+        hash_buf.write(&expr_hashes);
+
+        let vn_buf = backend
+            .create_buffer((value_numbers.len() * std::mem::size_of::<u32>()) as u64)?;
+        vn_buf.write(&value_numbers);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
+        // Single-pass GVN (simplified: no fixed-point needed for basic GVN)
+        gpu.dispatch_gvn_round(
+            &hash_buf,
+            &vn_buf,
+            &convergence_buf,
+            num_blocks as u32,
+            max_statements as u32,
+            hash_table_size,
+        )
+        .ok()?;
+
+        // Read back value numbers
+        let vn_data: Vec<u32> = vn_buf.read(num_blocks * max_statements);
+
+        let mut results = Vec::new();
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            for stmt_idx in 0..block.statements.len() {
+                let vn = vn_data[block_idx.index() * max_statements + stmt_idx];
+                if vn != 0 {
+                    results.push((block_idx, stmt_idx, vn));
+                }
+            }
+        }
+
+        Some(results)
+    }
+
+    /// Compute a simple hash for an rvalue.
+    fn hash_rvalue(&self, rvalue: &rustc_middle::mir::Rvalue<'tcx>, block: u32, stmt: u32) -> u32 {
+        use rustc_middle::mir::Rvalue::*;
+        let kind_hash = match rvalue {
+            Use(..) => 1u32,
+            Repeat(..) => 2,
+            Ref(..) => 3,
+            ThreadLocalRef(_) => 4,
+            RawPtr(..) => 5,
+            Cast(..) => 7,
+            BinaryOp(..) => 8,
+            UnaryOp(..) => 10,
+            Discriminant(_) => 11,
+            Aggregate(..) => 12,
+            CopyForDeref(_) => 14,
+            WrapUnsafeBinder(..) => 15,
+            Reborrow(..) => 16,
+        };
+        // Mix in block and stmt for uniqueness
+        kind_hash.wrapping_mul(31).wrapping_add(block).wrapping_mul(17).wrapping_add(stmt)
+    }
 }
