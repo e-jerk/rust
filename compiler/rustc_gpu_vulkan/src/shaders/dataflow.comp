@@ -2,13 +2,10 @@
 
 layout(local_size_x = 256) in;
 
+// Flat buffer: interleaved block configs [stmt_count, term_kind, succ_count, succ_0, succ_1]
 layout(set = 0, binding = 0) readonly buffer BlockConfig {
-    uint statement_count;
-    uint terminator_kind;
-    uint successor_count;
-    uint successor_0;
-    uint successor_1;
-} blocks[];
+    uint data[];
+} blocks;
 
 layout(set = 0, binding = 1) readonly buffer Effects {
     uint data[];
@@ -36,7 +33,13 @@ void main() {
     uint block_idx = gl_GlobalInvocationID.x;
     if (block_idx >= pc.num_blocks) return;
 
-    BlockConfig block = blocks[block_idx];
+    uint config_base = block_idx * 5;
+    uint statement_count = blocks.data[config_base];
+    uint terminator_kind = blocks.data[config_base + 1];
+    uint successor_count = blocks.data[config_base + 2];
+    uint successor_0 = blocks.data[config_base + 3];
+    uint successor_1 = blocks.data[config_base + 4];
+
     uint entry_offset = block_idx * pc.bitset_words;
 
     uint state[64]; // max 64 words = 2048 bits
@@ -46,7 +49,7 @@ void main() {
 
     // Apply statement effects
     uint effect_base = block_idx * pc.effects_stride;
-    for (uint stmt = 0; stmt < block.statement_count; stmt++) {
+    for (uint stmt = 0; stmt < statement_count; stmt++) {
         uint base = effect_base + stmt * 3u;
         uint word_idx = effects.data[base];
         uint gen_mask = effects.data[base + 1u];

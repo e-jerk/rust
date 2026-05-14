@@ -10,10 +10,10 @@ layout(set = 0, binding = 1) readonly buffer Offsets {
     uint data[];
 } body_offsets;
 
+// Flat buffer: pairs of (def_id, args_idx)
 layout(set = 0, binding = 2) writeonly buffer Edges {
-    uint def_id;
-    uint args_idx;
-} edges[];
+    uint data[];
+} edges;
 
 layout(set = 0, binding = 3) buffer EdgeCounter {
     uint count;
@@ -42,9 +42,9 @@ void main() {
         // uint reserved = actions.data[i + 3]; // padding
         
         if (kind == ACTION_CALL || kind == ACTION_DROP || kind == ACTION_CAST) {
-            uint edge_idx = atomicAdd(edge_counter.count, 1);
-            edges[edge_idx].def_id = def_id;
-            edges[edge_idx].args_idx = args_idx;
+            uint edge_idx = atomicAdd(edge_counter.count, 1) * 2;
+            edges.data[edge_idx] = def_id;
+            edges.data[edge_idx + 1] = args_idx;
         }
     }
 }
