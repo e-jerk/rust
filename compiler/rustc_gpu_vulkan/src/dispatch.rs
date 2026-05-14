@@ -20,13 +20,28 @@ impl<'ctx> GpuDispatch<'ctx> {
         edges_buf: &GpuBuffer,
         num_bodies: u32,
     ) -> Result<(), vk::Result> {
+        self.dispatch_with_counter(pipeline, actions_buf, offsets_buf, edges_buf, None, num_bodies)
+    }
+    
+    pub fn dispatch_with_counter(
+        &self,
+        pipeline: &ComputePipeline,
+        actions_buf: &GpuBuffer,
+        offsets_buf: &GpuBuffer,
+        edges_buf: &GpuBuffer,
+        counter_buf: Option<&GpuBuffer>,
+        num_bodies: u32,
+    ) -> Result<(), vk::Result> {
         let device = &self.context.device;
+        
+        // Determine descriptor count based on whether counter buffer is used
+        let descriptor_count = if counter_buf.is_some() { 4 } else { 3 };
         
         // Allocate descriptor set
         let descriptor_pool = unsafe {
             let pool_size = vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(3);
+                .descriptor_count(descriptor_count);
             let create_info = vk::DescriptorPoolCreateInfo::default()
                 .pool_sizes(std::slice::from_ref(&pool_size))
                 .max_sets(1);
@@ -41,12 +56,19 @@ impl<'ctx> GpuDispatch<'ctx> {
         };
         
         // Write descriptor set
-        let buffer_infos = [
+        let mut buffer_infos = vec![
             vk::DescriptorBufferInfo::default().buffer(actions_buf.buffer).range(actions_buf.size),
             vk::DescriptorBufferInfo::default().buffer(offsets_buf.buffer).range(offsets_buf.size),
             vk::DescriptorBufferInfo::default().buffer(edges_buf.buffer).range(edges_buf.size),
         ];
-        let writes = [
+        
+        if let Some(counter) = counter_buf {
+            buffer_infos.push(
+                vk::DescriptorBufferInfo::default().buffer(counter.buffer).range(counter.size),
+            );
+        }
+        
+        let mut writes = vec![
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
                 .dst_binding(0)
@@ -63,6 +85,17 @@ impl<'ctx> GpuDispatch<'ctx> {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&buffer_infos[2])),
         ];
+        
+        if counter_buf.is_some() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(&buffer_infos[3])),
+            );
+        }
+        
         unsafe { device.update_descriptor_sets(&writes, &[]); }
         
         // Record command buffer
@@ -88,22 +121,46 @@ impl<'ctx> GpuDispatch<'ctx> {
                 &[],
             );
             
+            // Push constants for num_bodies
+            let push_constants = num_bodies.to_ne_bytes();
+            device.cmd_push_constants(
+                cmd_buf,
+                pipeline.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                &push_constants,
+            );
+            
             let workgroup_count = (num_bodies + 63) / 64;
             device.cmd_dispatch(cmd_buf, workgroup_count, 1, 1);
             
             // Memory barrier for edges_buf
-            let barrier = vk::BufferMemoryBarrier::default()
-                .buffer(edges_buf.buffer)
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .size(vk::WHOLE_SIZE);
+            let barriers = [
+                vk::BufferMemoryBarrier::default()
+                    .buffer(edges_buf.buffer)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .size(vk::WHOLE_SIZE),
+                vk::BufferMemoryBarrier::default()
+                    .buffer(buffer_infos[3].buffer)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .size(vk::WHOLE_SIZE),
+            ];
+            
+            let barrier_slice = if counter_buf.is_some() {
+                &barriers[..]
+            } else {
+                &barriers[..1]
+            };
+            
             device.cmd_pipeline_barrier(
                 cmd_buf,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::HOST,
                 vk::DependencyFlags::empty(),
                 &[],
-                std::slice::from_ref(&barrier),
+                barrier_slice,
                 &[],
             );
             
