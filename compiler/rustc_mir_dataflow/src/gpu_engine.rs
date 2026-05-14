@@ -2636,6 +2636,90 @@ impl<'tcx> GpuEngine<'tcx> {
             return None;
         }
 
+        // Try Metal first (native Apple Silicon, ~1.5× faster than MoltenVK)
+        if let Some(result) = self.run_mega_batch_forward_analysis_metal(bodies) {
+            return Some(result);
+        }
+
+        // Fall back to Vulkan (cross-platform)
+        self.run_mega_batch_forward_analysis_vulkan(bodies)
+    }
+
+    fn run_mega_batch_forward_analysis_metal(
+        &self,
+        bodies: &[&'tcx Body<'tcx>],
+    ) -> Option<Vec<Vec<DenseBitSet<Local>>>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_mega_batch_dataflow_shader()?;
+        let pipeline = backend.get_pipeline(&metallib_path, "mega_batch_dataflow")?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
+            &backend.context,
+            pipeline,
+        );
+
+        let (meta, configs, effects, entry_states, exit_states, max_blocks) =
+            self.serialize_mega_batch(bodies);
+
+        let num_functions = bodies.len();
+        let blocks_per_workgroup = max_blocks;
+        let max_bitset_words = (bodies.iter().map(|b| b.local_decls.len()).max().unwrap_or(0) + 31) / 32;
+
+        let meta_buf = backend.create_buffer((meta.len() * std::mem::size_of::<u32>()) as u64)?;
+        meta_buf.write(&meta);
+
+        let config_buf = backend.create_buffer((configs.len() * std::mem::size_of::<u32>()) as u64)?;
+        config_buf.write(&configs);
+
+        let effects_buf = backend.create_buffer((effects.len() * std::mem::size_of::<u32>()) as u64)?;
+        effects_buf.write(&effects);
+
+        let entry_buf = backend.create_buffer((entry_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        entry_buf.write(&entry_states);
+
+        let exit_buf = backend.create_buffer((exit_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        exit_buf.write(&exit_states);
+
+        let convergence_buf = backend.create_buffer((num_functions * std::mem::size_of::<u32>()) as u64)?;
+
+        let mut round = 0;
+        const MAX_ROUNDS: u32 = 100;
+
+        loop {
+            gpu.dispatch_mega_batch(
+                &meta_buf,
+                &config_buf,
+                &effects_buf,
+                &entry_buf,
+                &exit_buf,
+                &convergence_buf,
+                num_functions as u32,
+                blocks_per_workgroup as u32,
+                max_bitset_words as u32,
+            )
+            .ok()?;
+
+            let conv_data: Vec<u32> = convergence_buf.read(num_functions);
+            let any_changed = conv_data.iter().any(|&x| x != 0);
+            round += 1;
+
+            if !any_changed || round >= MAX_ROUNDS {
+                break;
+            }
+
+            let exit_data: Vec<u32> = exit_buf.read(exit_states.len());
+            let mut entry_data: Vec<u32> = entry_buf.read(entry_states.len());
+            self.propagate_mega_batch_edges(bodies, &meta, &exit_data, &mut entry_data);
+            entry_buf.write(&entry_data);
+        }
+
+        let final_entry: Vec<u32> = entry_buf.read(entry_states.len());
+        Some(self.parse_mega_batch_results(bodies, &meta, &final_entry, max_bitset_words))
+    }
+
+    fn run_mega_batch_forward_analysis_vulkan(
+        &self,
+        bodies: &[&'tcx Body<'tcx>],
+    ) -> Option<Vec<Vec<DenseBitSet<Local>>>> {
         let backend = GpuBackend::new()?;
         let spirv = rustc_gpu_vulkan::load_mega_batch_dataflow_shader()?;
         let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
