@@ -2,14 +2,18 @@
 
 ## Current State Analysis
 
-We've implemented 12 GPU shaders covering:
+We've implemented 17 GPU shaders covering:
 - Monomorphization (20% of compile time, 2.5x speedup)
 - Dataflow analyses (12% of compile time, 3-4x speedup)
 - SSA construction (2%)
 - Dominance, loops, alias, GVN, induction vars (combined ~5%)
+- Borrow check (5%)
+- Macro expansion (5%)
+- Codegen partitioning (3%)
+- Fused 4-in-1 MIR optimization (4× overhead reduction)
 
-**Total frontend GPU coverage: ~44% of compile time**
-**Theoretical max speedup: 1.31x** (Amdahl's Law with 56% serial)
+**Total frontend GPU coverage: ~57% of compile time**
+**Theoretical max speedup: 1.52x** (Amdahl's Law with 43% serial)
 
 ## The Untapped 56%
 

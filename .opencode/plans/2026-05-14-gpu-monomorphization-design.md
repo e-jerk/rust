@@ -1,7 +1,7 @@
 # Design: GPU-Accelerated Monomorphization Collection in rustc
 
 **Date:** 2026-05-14  
-**Status:** Approved  
+**Status:** ✅ Complete — pipelined GPU collector with persistent buffers, 64K mega-batching  
 **Scope:** Vulkan compute acceleration of rustc frontend monomorphization  
 **Constraint:** Do not touch LLVM backend
 
