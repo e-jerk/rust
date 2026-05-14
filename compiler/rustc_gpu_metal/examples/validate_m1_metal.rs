@@ -167,23 +167,24 @@ fn main() {
             println!("  Effective per-analysis overhead: ~{}us",
                 per_dispatch.as_micros() / 4);
             
-            // Benchmark batched dispatch (10 per command buffer)
-            let batch_size = 10;
-            let num_batches = num_iterations / batch_size;
-            let batch: Vec<_> = (0..num_batches).map(|_| {
-                (&config_buf, &effects_buf, &entry_buf, &exit_buf, &convergence_buf,
-                 num_blocks, num_locals, bitset_words, effects_stride)
-            }).collect();
-            
-            let batch_start = Instant::now();
-            for _ in 0..10 {
-                let _ = engine.dispatch_fused_mir_opt_batch(&batch);
+            // Benchmark batched dispatch with different batch sizes
+            for batch_size in [2, 4, 8, 16] {
+                let num_batches = num_iterations / batch_size;
+                let batch: Vec<_> = (0..num_batches).map(|_| {
+                    (&config_buf, &effects_buf, &entry_buf, &exit_buf, &convergence_buf,
+                     num_blocks, num_locals, bitset_words, effects_stride)
+                }).collect();
+                
+                let batch_start = Instant::now();
+                for _ in 0..10 {
+                    let _ = engine.dispatch_fused_mir_opt_batch(&batch);
+                }
+                let batch_elapsed = batch_start.elapsed();
+                let per_batch_dispatch = batch_elapsed / (num_batches * 10);
+                
+                println!("  Batched ({} per cmd_buf): {:?} per dispatch",
+                    batch_size, per_batch_dispatch);
             }
-            let batch_elapsed = batch_start.elapsed();
-            let per_batch_dispatch = batch_elapsed / (num_batches * 10);
-            
-            println!("  Batched ({} per cmd_buf): {:?} per dispatch",
-                batch_size, per_batch_dispatch);
         }
     }
     
