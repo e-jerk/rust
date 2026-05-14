@@ -892,4 +892,165 @@ impl<'tcx> GpuEngine<'tcx> {
 
         propagations
     }
+
+    // ------------------------------------------------------------------
+    // GPU-accelerated Reaching Definitions (forward dataflow)
+    // ------------------------------------------------------------------
+
+    /// Run reaching definitions analysis on GPU.
+    ///
+    /// Returns a vector of (block, statement_idx, local, def_id) for all definition sites.
+    pub fn run_reaching_definitions(&self) -> Option<Vec<(BasicBlock, usize, Local, u32)>> {
+        if self.body.basic_blocks.len() < 50 {
+            return None;
+        }
+
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_reaching_defs_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let _num_locals = self.body.local_decls.len();
+        let max_defs = ((num_blocks * 16).min(1024)) as u32; // Cap at 1024 definitions
+        let bitset_words = ((max_defs + 31) / 32) as usize;
+
+        // Serialize definition facts
+        let (configs, def_facts, facts_stride, def_map) = self.serialize_def_facts(max_defs);
+
+        // Initialize entry states to 0 (no definitions reach)
+        let entry_states: Vec<u32> = vec![0; num_blocks * bitset_words];
+        let exit_states: Vec<u32> = vec![0; num_blocks * bitset_words];
+
+        let config_buf = backend
+            .create_buffer((configs.len() * std::mem::size_of::<u32>()) as u64)?;
+        config_buf.write(&configs);
+
+        let facts_buf = backend
+            .create_buffer((def_facts.len() * std::mem::size_of::<u32>()) as u64)?;
+        facts_buf.write(&def_facts);
+
+        let entry_buf = backend
+            .create_buffer((entry_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        entry_buf.write(&entry_states);
+
+        let exit_buf = backend
+            .create_buffer((exit_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        exit_buf.write(&exit_states);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
+        // Forward fixed-point iteration on GPU
+        let mut round = 0;
+        const MAX_ROUNDS: u32 = 200;
+
+        loop {
+            convergence_buf.write(&[0u32]);
+
+            // GPU computes exit states from entry states
+            gpu.dispatch_round(
+                &config_buf,
+                &facts_buf,
+                &entry_buf,
+                &exit_buf,
+                &convergence_buf,
+                num_blocks as u32,
+                bitset_words as u32,
+                facts_stride,
+            )
+            .ok()?;
+
+            let changed = gpu.read_convergence(&convergence_buf);
+            round += 1;
+
+            if !changed || round >= MAX_ROUNDS {
+                break;
+            }
+
+            // Propagate exit states to successor entry states on CPU
+            let exit_data: Vec<u32> = exit_buf.read(num_blocks * bitset_words);
+            let mut entry_data: Vec<u32> = entry_buf.read(num_blocks * bitset_words);
+            self.propagate_def_edges(&exit_data, &mut entry_data, bitset_words);
+            entry_buf.write(&entry_data);
+        }
+
+        // Read back final states
+        let _final_entry: Vec<u32> = entry_buf.read(num_blocks * bitset_words);
+
+        // Return the definition map
+        Some(def_map)
+    }
+
+    /// Serialize block configs and definition facts for reaching definitions.
+    fn serialize_def_facts(&self, max_defs: u32) -> (Vec<u32>, Vec<u32>, u32, Vec<(BasicBlock, usize, Local, u32)>) {
+        let num_blocks = self.body.basic_blocks.len();
+        let max_statements = self
+            .body
+            .basic_blocks
+            .iter()
+            .map(|b| b.statements.len())
+            .max()
+            .unwrap_or(0) as u32;
+
+        let mut configs = Vec::with_capacity(num_blocks * 4);
+        let mut facts = vec![0xFFFFFFFFu32; num_blocks * max_statements as usize];
+        let mut def_map = Vec::new();
+        let mut next_def_id: u32 = 0;
+
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            let terminator = block.terminator();
+            let successors: Vec<BasicBlock> = terminator.successors().collect();
+
+            let terminator_kind = match terminator.kind {
+                TerminatorKind::Goto { .. } => 0,
+                TerminatorKind::SwitchInt { .. } => 1,
+                TerminatorKind::Return => 2,
+                TerminatorKind::Unreachable => 3,
+                TerminatorKind::Call { .. } => 4,
+                TerminatorKind::Drop { .. } => 5,
+                _ => 6,
+            };
+
+            configs.push(block.statements.len() as u32);
+            configs.push(terminator_kind);
+            configs.push(
+                (successors.len() as u32 & 0xFFFF)
+                    | ((successors.get(0).map_or(u32::MAX, |b| b.as_u32()) & 0xFFFF) << 16),
+            );
+            configs.push(
+                successors.get(1).map_or(u32::MAX, |b| b.as_u32() & 0xFFFF),
+            );
+
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                if let StatementKind::Assign((place, _)) = &stmt.kind {
+                    if let Some(dst_local) = place.as_local() {
+                        if next_def_id < max_defs {
+                            let def_id = next_def_id;
+                            next_def_id += 1;
+                            let encoded = ((dst_local.as_u32() & 0xFFFF) << 16) | (def_id & 0xFFFF);
+                            facts[block_idx.index() * max_statements as usize + stmt_idx] = encoded;
+                            def_map.push((block_idx, stmt_idx, dst_local, def_id));
+                        }
+                    }
+                }
+            }
+        }
+
+        (configs, facts, max_statements, def_map)
+    }
+
+    /// Propagate exit definition states to successor entry states.
+    fn propagate_def_edges(&self, exit_states: &[u32], entry_states: &mut [u32], bitset_words: usize) {
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            let exit_start = block_idx.index() * bitset_words;
+
+            for succ in block.terminator().successors() {
+                let succ_idx = succ.index();
+                let entry_start = succ_idx * bitset_words;
+
+                for w in 0..bitset_words {
+                    entry_states[entry_start + w] |= exit_states[exit_start + w];
+                }
+            }
+        }
+    }
 }

@@ -61,4 +61,9 @@ fn main() {
         &out_dir,
         "CONST_PROP_SPV",
     );
+    compile_shader(
+        "src/shaders/reaching_defs.comp",
+        &out_dir,
+        "REACHING_DEFS_SPV",
+    );
 }
