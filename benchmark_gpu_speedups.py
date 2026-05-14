@@ -44,7 +44,7 @@ GPU_PHASES = {
     },
     "mir_optimizations": {
         "cpu_fraction": 0.12,
-        "gpu_speedup": 3.0,  # DSE + copy prop + const prop + reaching defs in parallel
+        "gpu_speedup": 3.0,  # DSE + copy prop + const prop + reaching defs + SSA + alias + dominance
         "kernel_launch_us": 50,
         "batch_size": 65536,
         "amortization_threshold": 5000,
@@ -55,6 +55,27 @@ GPU_PHASES = {
         "kernel_launch_us": 50,
         "batch_size": 65536,
         "amortization_threshold": 100,
+    },
+    "dominance_analysis": {
+        "cpu_fraction": 0.03,
+        "gpu_speedup": 5.0,  # Iterative fixed-point on GPU, 64-way parallel per round
+        "kernel_launch_us": 50,
+        "batch_size": 65536,
+        "amortization_threshold": 50,
+    },
+    "alias_analysis": {
+        "cpu_fraction": 0.02,
+        "gpu_speedup": 3.5,  # Pairwise comparison, O(N^2) but massively parallel
+        "kernel_launch_us": 50,
+        "batch_size": 65536,
+        "amortization_threshold": 30,
+    },
+    "ssa_construction": {
+        "cpu_fraction": 0.02,
+        "gpu_speedup": 4.0,  # Single-pass phi insertion
+        "kernel_launch_us": 50,
+        "batch_size": 65536,
+        "amortization_threshold": 50,
     },
 }
 
