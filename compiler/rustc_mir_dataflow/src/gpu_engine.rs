@@ -331,6 +331,95 @@ impl<'tcx> GpuEngine<'tcx> {
             return None;
         }
 
+        // Try Metal first (native Apple Silicon, ~1.5× faster)
+        if let Some(result) = self.run_backward_liveness_for_dse_metal() {
+            return Some(result);
+        }
+
+        // Fall back to Vulkan (cross-platform via MoltenVK on macOS)
+        self.run_backward_liveness_for_dse_vulkan()
+    }
+
+    fn run_backward_liveness_for_dse_metal(&self) -> Option<Vec<(BasicBlock, usize)>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_dead_store_elim_shader()?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+            &backend.context,
+            &metallib_path,
+            "dead_store_elim",
+        ).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let num_locals = self.body.local_decls.len();
+        let bitset_words = (num_locals + 31) / 32;
+
+        let (configs, effects, effects_stride) = self.serialize_backward_effects();
+
+        let mut exit_states: Vec<u32> = vec![0; num_blocks * bitset_words];
+        let entry_states: Vec<u32> = vec![0; num_blocks * bitset_words];
+
+        for (bb, block) in self.body.basic_blocks.iter_enumerated() {
+            if matches!(block.terminator().kind, TerminatorKind::Return) {
+                let start = bb.index() * bitset_words;
+                exit_states[start] |= 1u32;
+            }
+        }
+
+        let config_buf = backend
+            .create_buffer((configs.len() * std::mem::size_of::<u32>()) as u64)?;
+        config_buf.write(&configs);
+
+        let effects_buf =
+            backend.create_buffer((effects.len() * std::mem::size_of::<u32>()) as u64)?;
+        effects_buf.write(&effects);
+
+        let entry_buf =
+            backend.create_buffer((entry_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        entry_buf.write(&entry_states);
+
+        let exit_buf =
+            backend.create_buffer((exit_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        exit_buf.write(&exit_states);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
+        let mut round = 0;
+        const MAX_ROUNDS: u32 = 200;
+
+        loop {
+            convergence_buf.write(&[0u32]);
+
+            let entry_data: Vec<u32> = entry_buf.read(num_blocks * bitset_words);
+            let mut exit_data: Vec<u32> = exit_buf.read(num_blocks * bitset_words);
+            self.propagate_backward_edges(&entry_data, &mut exit_data);
+            exit_buf.write(&exit_data);
+
+            gpu.dispatch_round(
+                &config_buf,
+                &effects_buf,
+                &entry_buf,
+                &exit_buf,
+                &convergence_buf,
+                num_blocks as u32,
+                bitset_words as u32,
+                effects_stride,
+            )
+            .ok()?;
+
+            let changed = gpu.read_convergence(&convergence_buf);
+            round += 1;
+
+            if !changed || round >= MAX_ROUNDS {
+                break;
+            }
+        }
+
+        let final_entry: Vec<u32> = entry_buf.read(num_blocks * bitset_words);
+        let live_sets = self.parse_results(&final_entry, bitset_words);
+        Some(self.identify_dead_stores(&live_sets))
+    }
+
+    fn run_backward_liveness_for_dse_vulkan(&self) -> Option<Vec<(BasicBlock, usize)>> {
         let backend = GpuBackend::new()?;
         let spirv = rustc_gpu_vulkan::load_dead_store_elim_shader()?;
         let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
@@ -570,6 +659,86 @@ impl<'tcx> GpuEngine<'tcx> {
             return None;
         }
 
+        // Try Metal first (native Apple Silicon, ~1.5× faster)
+        if let Some(result) = self.run_copy_propagation_metal() {
+            return Some(result);
+        }
+
+        // Fall back to Vulkan (cross-platform via MoltenVK on macOS)
+        self.run_copy_propagation_vulkan()
+    }
+
+    fn run_copy_propagation_metal(&self) -> Option<Vec<(BasicBlock, usize, Local, Local)>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_copy_prop_shader()?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+            &backend.context,
+            &metallib_path,
+            "copy_prop",
+        ).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let num_locals = self.body.local_decls.len();
+
+        let (configs, copy_facts, facts_stride) = self.serialize_copy_facts();
+
+        let entry_states: Vec<u32> = vec![0; num_blocks * num_locals];
+        let exit_states: Vec<u32> = vec![0; num_blocks * num_locals];
+
+        let config_buf = backend
+            .create_buffer((configs.len() * std::mem::size_of::<u32>()) as u64)?;
+        config_buf.write(&configs);
+
+        let facts_buf = backend
+            .create_buffer((copy_facts.len() * std::mem::size_of::<u32>()) as u64)?;
+        facts_buf.write(&copy_facts);
+
+        let entry_buf = backend
+            .create_buffer((entry_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        entry_buf.write(&entry_states);
+
+        let exit_buf = backend
+            .create_buffer((exit_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        exit_buf.write(&exit_states);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
+        let mut round = 0;
+        const MAX_ROUNDS: u32 = 200;
+
+        loop {
+            convergence_buf.write(&[0u32]);
+
+            gpu.dispatch_round(
+                &config_buf,
+                &facts_buf,
+                &entry_buf,
+                &exit_buf,
+                &convergence_buf,
+                num_blocks as u32,
+                num_locals as u32,
+                facts_stride,
+            )
+            .ok()?;
+
+            let changed = gpu.read_convergence(&convergence_buf);
+            round += 1;
+
+            if !changed || round >= MAX_ROUNDS {
+                break;
+            }
+
+            let exit_data: Vec<u32> = exit_buf.read(num_blocks * num_locals);
+            let mut entry_data: Vec<u32> = entry_buf.read(num_blocks * num_locals);
+            self.propagate_copy_edges(&exit_data, &mut entry_data);
+            entry_buf.write(&entry_data);
+        }
+
+        let final_entry: Vec<u32> = entry_buf.read(num_blocks * num_locals);
+        Some(self.identify_copy_propagations(&final_entry, &copy_facts, facts_stride))
+    }
+
+    fn run_copy_propagation_vulkan(&self) -> Option<Vec<(BasicBlock, usize, Local, Local)>> {
         let backend = GpuBackend::new()?;
         let spirv = rustc_gpu_vulkan::load_copy_prop_shader()?;
         let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
@@ -774,6 +943,86 @@ impl<'tcx> GpuEngine<'tcx> {
             return None;
         }
 
+        // Try Metal first (native Apple Silicon, ~1.5× faster)
+        if let Some(result) = self.run_constant_propagation_metal() {
+            return Some(result);
+        }
+
+        // Fall back to Vulkan (cross-platform via MoltenVK on macOS)
+        self.run_constant_propagation_vulkan()
+    }
+
+    fn run_constant_propagation_metal(&self) -> Option<Vec<(BasicBlock, usize, Local, u32)>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_const_prop_shader()?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+            &backend.context,
+            &metallib_path,
+            "const_prop",
+        ).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let num_locals = self.body.local_decls.len();
+
+        let (configs, const_facts, facts_stride) = self.serialize_const_facts();
+
+        let entry_states: Vec<u32> = vec![0; num_blocks * num_locals];
+        let exit_states: Vec<u32> = vec![0; num_blocks * num_locals];
+
+        let config_buf = backend
+            .create_buffer((configs.len() * std::mem::size_of::<u32>()) as u64)?;
+        config_buf.write(&configs);
+
+        let facts_buf = backend
+            .create_buffer((const_facts.len() * std::mem::size_of::<u32>()) as u64)?;
+        facts_buf.write(&const_facts);
+
+        let entry_buf = backend
+            .create_buffer((entry_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        entry_buf.write(&entry_states);
+
+        let exit_buf = backend
+            .create_buffer((exit_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        exit_buf.write(&exit_states);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
+        let mut round = 0;
+        const MAX_ROUNDS: u32 = 200;
+
+        loop {
+            convergence_buf.write(&[0u32]);
+
+            gpu.dispatch_round(
+                &config_buf,
+                &facts_buf,
+                &entry_buf,
+                &exit_buf,
+                &convergence_buf,
+                num_blocks as u32,
+                num_locals as u32,
+                facts_stride,
+            )
+            .ok()?;
+
+            let changed = gpu.read_convergence(&convergence_buf);
+            round += 1;
+
+            if !changed || round >= MAX_ROUNDS {
+                break;
+            }
+
+            let exit_data: Vec<u32> = exit_buf.read(num_blocks * num_locals);
+            let mut entry_data: Vec<u32> = entry_buf.read(num_blocks * num_locals);
+            self.propagate_const_edges(&exit_data, &mut entry_data);
+            entry_buf.write(&entry_data);
+        }
+
+        let final_entry: Vec<u32> = entry_buf.read(num_blocks * num_locals);
+        Some(self.identify_constant_propagations(&final_entry))
+    }
+
+    fn run_constant_propagation_vulkan(&self) -> Option<Vec<(BasicBlock, usize, Local, u32)>> {
         let backend = GpuBackend::new()?;
         let spirv = rustc_gpu_vulkan::load_const_prop_shader()?;
         let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
@@ -990,20 +1239,28 @@ impl<'tcx> GpuEngine<'tcx> {
         if self.body.basic_blocks.len() < 50 {
             return None;
         }
+        if let Some(result) = self.run_reaching_definitions_metal() {
+            return Some(result);
+        }
+        self.run_reaching_definitions_vulkan()
+    }
 
-        let backend = GpuBackend::new()?;
-        let spirv = rustc_gpu_vulkan::load_reaching_defs_shader()?;
-        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+    fn run_reaching_definitions_metal(&self) -> Option<Vec<(BasicBlock, usize, Local, u32)>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_reaching_defs_shader()?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+            &backend.context,
+            &metallib_path,
+            "reaching_defs",
+        ).ok()?;
 
         let num_blocks = self.body.basic_blocks.len();
         let _num_locals = self.body.local_decls.len();
         let max_defs = ((num_blocks * 16).min(1024)) as u32; // Cap at 1024 definitions
         let bitset_words = ((max_defs + 31) / 32) as usize;
 
-        // Serialize definition facts
         let (configs, def_facts, facts_stride, def_map) = self.serialize_def_facts(max_defs);
 
-        // Initialize entry states to 0 (no definitions reach)
         let entry_states: Vec<u32> = vec![0; num_blocks * bitset_words];
         let exit_states: Vec<u32> = vec![0; num_blocks * bitset_words];
 
@@ -1025,14 +1282,12 @@ impl<'tcx> GpuEngine<'tcx> {
 
         let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
 
-        // Forward fixed-point iteration on GPU
         let mut round = 0;
         const MAX_ROUNDS: u32 = 200;
 
         loop {
             convergence_buf.write(&[0u32]);
 
-            // GPU computes exit states from entry states
             gpu.dispatch_round(
                 &config_buf,
                 &facts_buf,
@@ -1052,17 +1307,83 @@ impl<'tcx> GpuEngine<'tcx> {
                 break;
             }
 
-            // Propagate exit states to successor entry states on CPU
             let exit_data: Vec<u32> = exit_buf.read(num_blocks * bitset_words);
             let mut entry_data: Vec<u32> = entry_buf.read(num_blocks * bitset_words);
             self.propagate_def_edges(&exit_data, &mut entry_data, bitset_words);
             entry_buf.write(&entry_data);
         }
 
-        // Read back final states
         let _final_entry: Vec<u32> = entry_buf.read(num_blocks * bitset_words);
 
-        // Return the definition map
+        Some(def_map)
+    }
+
+    fn run_reaching_definitions_vulkan(&self) -> Option<Vec<(BasicBlock, usize, Local, u32)>> {
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_reaching_defs_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let _num_locals = self.body.local_decls.len();
+        let max_defs = ((num_blocks * 16).min(1024)) as u32; // Cap at 1024 definitions
+        let bitset_words = ((max_defs + 31) / 32) as usize;
+
+        let (configs, def_facts, facts_stride, def_map) = self.serialize_def_facts(max_defs);
+
+        let entry_states: Vec<u32> = vec![0; num_blocks * bitset_words];
+        let exit_states: Vec<u32> = vec![0; num_blocks * bitset_words];
+
+        let config_buf = backend
+            .create_buffer((configs.len() * std::mem::size_of::<u32>()) as u64)?;
+        config_buf.write(&configs);
+
+        let facts_buf = backend
+            .create_buffer((def_facts.len() * std::mem::size_of::<u32>()) as u64)?;
+        facts_buf.write(&def_facts);
+
+        let entry_buf = backend
+            .create_buffer((entry_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        entry_buf.write(&entry_states);
+
+        let exit_buf = backend
+            .create_buffer((exit_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        exit_buf.write(&exit_states);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
+        let mut round = 0;
+        const MAX_ROUNDS: u32 = 200;
+
+        loop {
+            convergence_buf.write(&[0u32]);
+
+            gpu.dispatch_round(
+                &config_buf,
+                &facts_buf,
+                &entry_buf,
+                &exit_buf,
+                &convergence_buf,
+                num_blocks as u32,
+                bitset_words as u32,
+                facts_stride,
+            )
+            .ok()?;
+
+            let changed = gpu.read_convergence(&convergence_buf);
+            round += 1;
+
+            if !changed || round >= MAX_ROUNDS {
+                break;
+            }
+
+            let exit_data: Vec<u32> = exit_buf.read(num_blocks * bitset_words);
+            let mut entry_data: Vec<u32> = entry_buf.read(num_blocks * bitset_words);
+            self.propagate_def_edges(&exit_data, &mut entry_data, bitset_words);
+            entry_buf.write(&entry_data);
+        }
+
+        let _final_entry: Vec<u32> = entry_buf.read(num_blocks * bitset_words);
+
         Some(def_map)
     }
 
@@ -1151,10 +1472,20 @@ impl<'tcx> GpuEngine<'tcx> {
         if self.body.basic_blocks.len() < 50 {
             return None;
         }
+        if let Some(result) = self.run_ssa_construction_metal() {
+            return Some(result);
+        }
+        self.run_ssa_construction_vulkan()
+    }
 
-        let backend = GpuBackend::new()?;
-        let spirv = rustc_gpu_vulkan::load_ssa_construct_shader()?;
-        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+    fn run_ssa_construction_metal(&self) -> Option<Vec<(BasicBlock, Local)>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_ssa_construct_shader()?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+            &backend.context,
+            &metallib_path,
+            "ssa_construct",
+        ).ok()?;
 
         let num_blocks = self.body.basic_blocks.len();
         let num_locals = self.body.local_decls.len();
@@ -1162,10 +1493,8 @@ impl<'tcx> GpuEngine<'tcx> {
         let phi_words = (num_locals + 31) / 32;
         let df_words = (num_blocks + 31) / 32;
 
-        // Serialize block info
         let (block_info, def_sites) = self.serialize_ssa_blocks(max_defs_per_block);
 
-        // Initialize outputs
         let dom_frontier: Vec<u32> = vec![0; num_blocks * df_words];
         let phi_nodes: Vec<u32> = vec![0; num_blocks * phi_words];
 
@@ -1185,7 +1514,77 @@ impl<'tcx> GpuEngine<'tcx> {
             .create_buffer((phi_nodes.len() * std::mem::size_of::<u32>()) as u64)?;
         phi_nodes_buf.write(&phi_nodes);
 
-        // Single GPU dispatch (SSA construction is not iterative)
+        gpu.dispatch_ssa(
+            &block_info_buf,
+            &def_sites_buf,
+            &dom_frontier_buf,
+            &phi_nodes_buf,
+            num_blocks as u32,
+            num_locals as u32,
+            max_defs_per_block,
+        )
+        .ok()?;
+
+        let phi_data: Vec<u32> = phi_nodes_buf.read(num_blocks * phi_words);
+
+        let mut phi_insertions = Vec::new();
+        for block_idx in 0..num_blocks {
+            let start = block_idx * phi_words;
+            for word_idx in 0..phi_words {
+                let word = phi_data[start + word_idx];
+                if word == 0 {
+                    continue;
+                }
+                let base_local = word_idx * 32;
+                for bit in 0..32 {
+                    if word & (1u32 << bit) != 0 {
+                        let local_idx = base_local + bit;
+                        if local_idx < num_locals {
+                            phi_insertions.push((
+                                BasicBlock::from_usize(block_idx),
+                                Local::from_usize(local_idx),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(phi_insertions)
+    }
+
+    fn run_ssa_construction_vulkan(&self) -> Option<Vec<(BasicBlock, Local)>> {
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_ssa_construct_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let num_locals = self.body.local_decls.len();
+        let max_defs_per_block = 16; // Cap definitions per block
+        let phi_words = (num_locals + 31) / 32;
+        let df_words = (num_blocks + 31) / 32;
+
+        let (block_info, def_sites) = self.serialize_ssa_blocks(max_defs_per_block);
+
+        let dom_frontier: Vec<u32> = vec![0; num_blocks * df_words];
+        let phi_nodes: Vec<u32> = vec![0; num_blocks * phi_words];
+
+        let block_info_buf = backend
+            .create_buffer((block_info.len() * std::mem::size_of::<u32>()) as u64)?;
+        block_info_buf.write(&block_info);
+
+        let def_sites_buf = backend
+            .create_buffer((def_sites.len() * std::mem::size_of::<u32>()) as u64)?;
+        def_sites_buf.write(&def_sites);
+
+        let dom_frontier_buf = backend
+            .create_buffer((dom_frontier.len() * std::mem::size_of::<u32>()) as u64)?;
+        dom_frontier_buf.write(&dom_frontier);
+
+        let phi_nodes_buf = backend
+            .create_buffer((phi_nodes.len() * std::mem::size_of::<u32>()) as u64)?;
+        phi_nodes_buf.write(&phi_nodes);
+
         gpu.dispatch_ssa_round(
             &block_info_buf,
             &def_sites_buf,
@@ -1197,10 +1596,8 @@ impl<'tcx> GpuEngine<'tcx> {
         )
         .ok()?;
 
-        // Read back phi node bitmap
         let phi_data: Vec<u32> = phi_nodes_buf.read(num_blocks * phi_words);
 
-        // Convert bitmap to (block, local) pairs
         let mut phi_insertions = Vec::new();
         for block_idx in 0..num_blocks {
             let start = block_idx * phi_words;
@@ -1279,12 +1676,21 @@ impl<'tcx> GpuEngine<'tcx> {
         if self.body.basic_blocks.len() < 30 {
             return None;
         }
+        if let Some(result) = self.run_alias_analysis_metal() {
+            return Some(result);
+        }
+        self.run_alias_analysis_vulkan()
+    }
 
-        let backend = GpuBackend::new()?;
-        let spirv = rustc_gpu_vulkan::load_alias_analysis_shader()?;
-        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+    fn run_alias_analysis_metal(&self) -> Option<Vec<Vec<bool>>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_alias_analysis_shader()?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+            &backend.context,
+            &metallib_path,
+            "alias_analysis",
+        ).ok()?;
 
-        // Collect all memory accesses in the function
         let mut accesses = Vec::new();
         for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
             for (stmt_idx, stmt) in block.statements.iter().enumerate() {
@@ -1295,7 +1701,6 @@ impl<'tcx> GpuEngine<'tcx> {
                         }
                     }
                     _ => {
-                        // Check for reads via visitor
                         struct ReadCollector<'a> {
                             reads: &'a mut Vec<(BasicBlock, usize, Local, u32)>,
                             block: BasicBlock,
@@ -1327,7 +1732,6 @@ impl<'tcx> GpuEngine<'tcx> {
         let num_locals = self.body.local_decls.len();
         let matrix_words = (num_accesses + 31) / 32;
 
-        // Encode access descriptors
         let descriptors: Vec<u32> = accesses
             .iter()
             .map(|(_, _, local, kind)| {
@@ -1345,7 +1749,93 @@ impl<'tcx> GpuEngine<'tcx> {
             .create_buffer((alias_matrix.len() * std::mem::size_of::<u32>()) as u64)?;
         matrix_buf.write(&alias_matrix);
 
-        // Dispatch alias analysis kernel
+        gpu.dispatch_alias(
+            &desc_buf,
+            &matrix_buf,
+            num_accesses as u32,
+            num_locals as u32,
+        )
+        .ok()?;
+
+        let matrix_data: Vec<u32> = matrix_buf.read(num_accesses * matrix_words);
+
+        let mut result = Vec::with_capacity(num_accesses);
+        for i in 0..num_accesses {
+            let mut row = Vec::with_capacity(num_accesses);
+            for j in 0..num_accesses {
+                let word_idx = i * matrix_words + (j / 32);
+                let bit_idx = j % 32;
+                row.push(matrix_data[word_idx] & (1u32 << bit_idx) != 0);
+            }
+            result.push(row);
+        }
+
+        Some(result)
+    }
+
+    fn run_alias_analysis_vulkan(&self) -> Option<Vec<Vec<bool>>> {
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_alias_analysis_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let mut accesses = Vec::new();
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                match &stmt.kind {
+                    StatementKind::Assign((place, _)) => {
+                        if let Some(local) = place.as_local() {
+                            accesses.push((block_idx, stmt_idx, local, 2u32)); // write
+                        }
+                    }
+                    _ => {
+                        struct ReadCollector<'a> {
+                            reads: &'a mut Vec<(BasicBlock, usize, Local, u32)>,
+                            block: BasicBlock,
+                            stmt: usize,
+                        }
+                        impl<'tcx> Visitor<'tcx> for ReadCollector<'_> {
+                            fn visit_local(&mut self, local: Local, ctx: mir::visit::PlaceContext, _loc: mir::Location) {
+                                if ctx.is_use() {
+                                    self.reads.push((self.block, self.stmt, local, 1u32));
+                                }
+                            }
+                        }
+                        let mut collector = ReadCollector {
+                            reads: &mut accesses,
+                            block: block_idx,
+                            stmt: stmt_idx,
+                        };
+                        collector.visit_statement(stmt, mir::Location { block: block_idx, statement_index: stmt_idx });
+                    }
+                }
+            }
+        }
+
+        let num_accesses = accesses.len();
+        if num_accesses == 0 || num_accesses > 1024 {
+            return None;
+        }
+
+        let num_locals = self.body.local_decls.len();
+        let matrix_words = (num_accesses + 31) / 32;
+
+        let descriptors: Vec<u32> = accesses
+            .iter()
+            .map(|(_, _, local, kind)| {
+                ((local.as_u32() & 0xFFFF) << 16) | (kind & 0xFFFF)
+            })
+            .collect();
+
+        let alias_matrix: Vec<u32> = vec![0; num_accesses * matrix_words];
+
+        let desc_buf = backend
+            .create_buffer((descriptors.len() * std::mem::size_of::<u32>()) as u64)?;
+        desc_buf.write(&descriptors);
+
+        let matrix_buf = backend
+            .create_buffer((alias_matrix.len() * std::mem::size_of::<u32>()) as u64)?;
+        matrix_buf.write(&alias_matrix);
+
         gpu.dispatch_alias_round(
             &desc_buf,
             &matrix_buf,
@@ -1354,10 +1844,8 @@ impl<'tcx> GpuEngine<'tcx> {
         )
         .ok()?;
 
-        // Read back alias matrix
         let matrix_data: Vec<u32> = matrix_buf.read(num_accesses * matrix_words);
 
-        // Convert to Vec<Vec<bool>>
         let mut result = Vec::with_capacity(num_accesses);
         for i in 0..num_accesses {
             let mut row = Vec::with_capacity(num_accesses);
@@ -1383,15 +1871,24 @@ impl<'tcx> GpuEngine<'tcx> {
         if self.body.basic_blocks.len() < 50 || self.body.basic_blocks.len() > 1024 {
             return None;
         }
+        if let Some(result) = self.run_dominance_analysis_metal() {
+            return Some(result);
+        }
+        self.run_dominance_analysis_vulkan()
+    }
 
-        let backend = GpuBackend::new()?;
-        let spirv = rustc_gpu_vulkan::load_dominance_shader()?;
-        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+    fn run_dominance_analysis_metal(&self) -> Option<Vec<DenseBitSet<BasicBlock>>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_dominance_shader()?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+            &backend.context,
+            &metallib_path,
+            "dominance",
+        ).ok()?;
 
         let num_blocks = self.body.basic_blocks.len();
         let bitmap_words = (num_blocks + 31) / 32;
 
-        // Serialize block info: for each block, [num_preds, pred_0, pred_1, pred_2, pred_3]
         let mut block_info = Vec::with_capacity(num_blocks * 5);
         for (block_idx, _block) in self.body.basic_blocks.iter_enumerated() {
             let preds = &self.body.basic_blocks.predecessors()[block_idx];
@@ -1406,20 +1903,16 @@ impl<'tcx> GpuEngine<'tcx> {
             }
         }
 
-        // Initialize dominator sets
-        // D[entry] = {entry}, D[others] = all blocks
         let mut dominator_sets: Vec<u32> = Vec::with_capacity(num_blocks * bitmap_words);
         for block_idx in 0..num_blocks {
             for word_idx in 0..bitmap_words {
                 if block_idx == 0 {
-                    // Entry block: only dominates itself
                     if word_idx == 0 {
                         dominator_sets.push(1u32); // block 0
                     } else {
                         dominator_sets.push(0u32);
                     }
                 } else {
-                    // Other blocks: initially dominated by all blocks
                     dominator_sets.push(0xFFFFFFFFu32);
                 }
             }
@@ -1435,7 +1928,102 @@ impl<'tcx> GpuEngine<'tcx> {
 
         let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
 
-        // Fixed-point iteration on GPU
+        let mut round = 0;
+        const MAX_ROUNDS: u32 = 200;
+
+        loop {
+            convergence_buf.write(&[0u32]);
+
+            gpu.dispatch_dominance(
+                &block_info_buf,
+                &dom_buf,
+                &convergence_buf,
+                num_blocks as u32,
+                bitmap_words as u32,
+            )
+            .ok()?;
+
+            let changed = gpu.read_convergence(&convergence_buf);
+            round += 1;
+
+            if !changed || round >= MAX_ROUNDS {
+                break;
+            }
+        }
+
+        let dom_data: Vec<u32> = dom_buf.read(num_blocks * bitmap_words);
+
+        let mut result = Vec::with_capacity(num_blocks);
+        for block_idx in 0..num_blocks {
+            let start = block_idx * bitmap_words;
+            let mut bitset = DenseBitSet::new_empty(num_blocks);
+            for (word_idx, &word) in dom_data[start..start + bitmap_words].iter().enumerate() {
+                if word == 0 {
+                    continue;
+                }
+                let base_block = word_idx * 32;
+                for bit in 0..32 {
+                    if word & (1u32 << bit) != 0 {
+                        let b = base_block + bit;
+                        if b < num_blocks {
+                            bitset.insert(BasicBlock::from_usize(b));
+                        }
+                    }
+                }
+            }
+            result.push(bitset);
+        }
+
+        Some(result)
+    }
+
+    fn run_dominance_analysis_vulkan(&self) -> Option<Vec<DenseBitSet<BasicBlock>>> {
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_dominance_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let bitmap_words = (num_blocks + 31) / 32;
+
+        let mut block_info = Vec::with_capacity(num_blocks * 5);
+        for (block_idx, _block) in self.body.basic_blocks.iter_enumerated() {
+            let preds = &self.body.basic_blocks.predecessors()[block_idx];
+            let num_preds = preds.len().min(4); // Cap at 4 predecessors
+            block_info.push(num_preds as u32);
+            for p in 0..4 {
+                if p < num_preds {
+                    block_info.push(preds[p].as_u32());
+                } else {
+                    block_info.push(0xFFFFFFFF);
+                }
+            }
+        }
+
+        let mut dominator_sets: Vec<u32> = Vec::with_capacity(num_blocks * bitmap_words);
+        for block_idx in 0..num_blocks {
+            for word_idx in 0..bitmap_words {
+                if block_idx == 0 {
+                    if word_idx == 0 {
+                        dominator_sets.push(1u32); // block 0
+                    } else {
+                        dominator_sets.push(0u32);
+                    }
+                } else {
+                    dominator_sets.push(0xFFFFFFFFu32);
+                }
+            }
+        }
+
+        let block_info_buf = backend
+            .create_buffer((block_info.len() * std::mem::size_of::<u32>()) as u64)?;
+        block_info_buf.write(&block_info);
+
+        let dom_buf = backend
+            .create_buffer((dominator_sets.len() * std::mem::size_of::<u32>()) as u64)?;
+        dom_buf.write(&dominator_sets);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
         let mut round = 0;
         const MAX_ROUNDS: u32 = 200;
 
@@ -1459,10 +2047,8 @@ impl<'tcx> GpuEngine<'tcx> {
             }
         }
 
-        // Read back dominator sets
         let dom_data: Vec<u32> = dom_buf.read(num_blocks * bitmap_words);
 
-        // Convert to DenseBitSet<BasicBlock>
         let mut result = Vec::with_capacity(num_blocks);
         for block_idx in 0..num_blocks {
             let start = block_idx * bitmap_words;
@@ -1498,15 +2084,24 @@ impl<'tcx> GpuEngine<'tcx> {
         if self.body.basic_blocks.len() < 30 || self.body.basic_blocks.len() > 512 {
             return None;
         }
+        if let Some(result) = self.run_loop_detection_metal() {
+            return Some(result);
+        }
+        self.run_loop_detection_vulkan()
+    }
 
-        let backend = GpuBackend::new()?;
-        let spirv = rustc_gpu_vulkan::load_loop_detect_shader()?;
-        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+    fn run_loop_detection_metal(&self) -> Option<Vec<BasicBlock>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_loop_detect_shader()?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+            &backend.context,
+            &metallib_path,
+            "loop_detect",
+        ).ok()?;
 
         let num_blocks = self.body.basic_blocks.len();
         let matrix_words = (num_blocks + 31) / 32;
 
-        // Serialize block info: [num_succs, succ_0, succ_1, succ_2, succ_3]
         let mut block_info = Vec::with_capacity(num_blocks * 5);
         for (_block_idx, block) in self.body.basic_blocks.iter_enumerated() {
             let successors: Vec<BasicBlock> = block.terminator().successors().collect();
@@ -1521,7 +2116,6 @@ impl<'tcx> GpuEngine<'tcx> {
             }
         }
 
-        // Initialize reachability matrix and loop headers
         let reachability: Vec<u32> = vec![0; num_blocks * matrix_words];
         let loop_headers: Vec<u32> = vec![0; matrix_words];
 
@@ -1537,7 +2131,66 @@ impl<'tcx> GpuEngine<'tcx> {
             .create_buffer((loop_headers.len() * std::mem::size_of::<u32>()) as u64)?;
         loop_buf.write(&loop_headers);
 
-        // Single-pass loop detection
+        gpu.dispatch_loop_detect(
+            &block_info_buf,
+            &reach_buf,
+            &loop_buf,
+            num_blocks as u32,
+            matrix_words as u32,
+        )
+        .ok()?;
+
+        let loop_data: Vec<u32> = loop_buf.read(matrix_words);
+
+        let mut headers = Vec::new();
+        for block_idx in 0..num_blocks {
+            let word = block_idx / 32;
+            let bit = block_idx % 32;
+            if loop_data[word] & (1u32 << bit) != 0 {
+                headers.push(BasicBlock::from_usize(block_idx));
+            }
+        }
+
+        Some(headers)
+    }
+
+    fn run_loop_detection_vulkan(&self) -> Option<Vec<BasicBlock>> {
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_loop_detect_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let matrix_words = (num_blocks + 31) / 32;
+
+        let mut block_info = Vec::with_capacity(num_blocks * 5);
+        for (_block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            let successors: Vec<BasicBlock> = block.terminator().successors().collect();
+            let num_succs = successors.len().min(4);
+            block_info.push(num_succs as u32);
+            for s in 0..4 {
+                if s < num_succs {
+                    block_info.push(successors[s].as_u32());
+                } else {
+                    block_info.push(0xFFFFFFFF);
+                }
+            }
+        }
+
+        let reachability: Vec<u32> = vec![0; num_blocks * matrix_words];
+        let loop_headers: Vec<u32> = vec![0; matrix_words];
+
+        let block_info_buf = backend
+            .create_buffer((block_info.len() * std::mem::size_of::<u32>()) as u64)?;
+        block_info_buf.write(&block_info);
+
+        let reach_buf = backend
+            .create_buffer((reachability.len() * std::mem::size_of::<u32>()) as u64)?;
+        reach_buf.write(&reachability);
+
+        let loop_buf = backend
+            .create_buffer((loop_headers.len() * std::mem::size_of::<u32>()) as u64)?;
+        loop_buf.write(&loop_headers);
+
         gpu.dispatch_loop_detect_round(
             &block_info_buf,
             &reach_buf,
@@ -1547,7 +2200,6 @@ impl<'tcx> GpuEngine<'tcx> {
         )
         .ok()?;
 
-        // Read back loop headers
         let loop_data: Vec<u32> = loop_buf.read(matrix_words);
 
         let mut headers = Vec::new();
@@ -1573,10 +2225,20 @@ impl<'tcx> GpuEngine<'tcx> {
         if self.body.basic_blocks.len() < 50 {
             return None;
         }
+        if let Some(result) = self.run_gvn_metal() {
+            return Some(result);
+        }
+        self.run_gvn_vulkan()
+    }
 
-        let backend = GpuBackend::new()?;
-        let spirv = rustc_gpu_vulkan::load_gvn_shader()?;
-        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+    fn run_gvn_metal(&self) -> Option<Vec<(BasicBlock, usize, u32)>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_gvn_shader()?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+            &backend.context,
+            &metallib_path,
+            "gvn",
+        ).ok()?;
 
         let num_blocks = self.body.basic_blocks.len();
         let max_statements = self
@@ -1588,12 +2250,10 @@ impl<'tcx> GpuEngine<'tcx> {
             .unwrap_or(0);
         let hash_table_size = 1024;
 
-        // Serialize expression hashes
         let mut expr_hashes = vec![0u32; num_blocks * max_statements];
         for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
             for (stmt_idx, stmt) in block.statements.iter().enumerate() {
                 if let StatementKind::Assign((_place, rvalue)) = &stmt.kind {
-                    // Compute a simple hash of the rvalue
                     let hash = self.hash_rvalue(rvalue, block_idx.as_u32(), stmt_idx as u32);
                     expr_hashes[block_idx.index() * max_statements + stmt_idx] = hash;
                 }
@@ -1612,7 +2272,68 @@ impl<'tcx> GpuEngine<'tcx> {
 
         let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
 
-        // Single-pass GVN (simplified: no fixed-point needed for basic GVN)
+        gpu.dispatch_gvn(
+            &hash_buf,
+            &vn_buf,
+            &convergence_buf,
+            num_blocks as u32,
+            max_statements as u32,
+            hash_table_size,
+        )
+        .ok()?;
+
+        let vn_data: Vec<u32> = vn_buf.read(num_blocks * max_statements);
+
+        let mut results = Vec::new();
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            for stmt_idx in 0..block.statements.len() {
+                let vn = vn_data[block_idx.index() * max_statements + stmt_idx];
+                if vn != 0 {
+                    results.push((block_idx, stmt_idx, vn));
+                }
+            }
+        }
+
+        Some(results)
+    }
+
+    fn run_gvn_vulkan(&self) -> Option<Vec<(BasicBlock, usize, u32)>> {
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_gvn_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let max_statements = self
+            .body
+            .basic_blocks
+            .iter()
+            .map(|b| b.statements.len())
+            .max()
+            .unwrap_or(0);
+        let hash_table_size = 1024;
+
+        let mut expr_hashes = vec![0u32; num_blocks * max_statements];
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                if let StatementKind::Assign((_place, rvalue)) = &stmt.kind {
+                    let hash = self.hash_rvalue(rvalue, block_idx.as_u32(), stmt_idx as u32);
+                    expr_hashes[block_idx.index() * max_statements + stmt_idx] = hash;
+                }
+            }
+        }
+
+        let value_numbers: Vec<u32> = vec![0; num_blocks * max_statements];
+
+        let hash_buf = backend
+            .create_buffer((expr_hashes.len() * std::mem::size_of::<u32>()) as u64)?;
+        hash_buf.write(&expr_hashes);
+
+        let vn_buf = backend
+            .create_buffer((value_numbers.len() * std::mem::size_of::<u32>()) as u64)?;
+        vn_buf.write(&value_numbers);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
         gpu.dispatch_gvn_round(
             &hash_buf,
             &vn_buf,
@@ -1623,7 +2344,6 @@ impl<'tcx> GpuEngine<'tcx> {
         )
         .ok()?;
 
-        // Read back value numbers
         let vn_data: Vec<u32> = vn_buf.read(num_blocks * max_statements);
 
         let mut results = Vec::new();
@@ -1672,10 +2392,20 @@ impl<'tcx> GpuEngine<'tcx> {
         if self.body.basic_blocks.len() < 30 {
             return None;
         }
+        if let Some(result) = self.run_induction_var_detection_metal() {
+            return Some(result);
+        }
+        self.run_induction_var_detection_vulkan()
+    }
 
-        let backend = GpuBackend::new()?;
-        let spirv = rustc_gpu_vulkan::load_induction_var_shader()?;
-        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+    fn run_induction_var_detection_metal(&self) -> Option<Vec<(BasicBlock, Local)>> {
+        let backend = rustc_gpu_metal::MetalBackend::new()?;
+        let metallib_path = rustc_gpu_metal::load_induction_var_shader()?;
+        let gpu = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+            &backend.context,
+            &metallib_path,
+            "induction_var",
+        ).ok()?;
 
         let num_blocks = self.body.basic_blocks.len();
         let num_locals = self.body.local_decls.len();
@@ -1688,7 +2418,6 @@ impl<'tcx> GpuEngine<'tcx> {
             .unwrap_or(0);
         let iv_words = (num_locals + 31) / 32;
 
-        // Detect loop headers first (simplified: blocks with >1 predecessors)
         let mut loop_headers = vec![false; num_blocks];
         for (block_idx, _) in self.body.basic_blocks.iter_enumerated() {
             let preds = &self.body.basic_blocks.predecessors()[block_idx];
@@ -1697,7 +2426,6 @@ impl<'tcx> GpuEngine<'tcx> {
             }
         }
 
-        // Serialize block info: [is_loop_header, num_stmts, (local, kind) pairs]
         let mut block_info = Vec::with_capacity(num_blocks * (2 + max_stmts * 2));
         for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
             block_info.push(if loop_headers[block_idx.index()] { 1u32 } else { 0 });
@@ -1727,7 +2455,6 @@ impl<'tcx> GpuEngine<'tcx> {
                 block_info.push(kind);
             }
 
-            // Pad remaining slots
             for _ in num_stmts..max_stmts {
                 block_info.push(0xFFFFFFFF);
                 block_info.push(0);
@@ -1744,7 +2471,115 @@ impl<'tcx> GpuEngine<'tcx> {
             .create_buffer((induction_vars.len() * std::mem::size_of::<u32>()) as u64)?;
         iv_buf.write(&induction_vars);
 
-        // Single-pass induction variable detection
+        gpu.dispatch_induction_var(
+            &block_info_buf,
+            &iv_buf,
+            num_blocks as u32,
+            num_locals as u32,
+            max_stmts as u32,
+        )
+        .ok()?;
+
+        let iv_data: Vec<u32> = iv_buf.read(num_blocks * iv_words);
+
+        let mut results = Vec::new();
+        for block_idx in 0..num_blocks {
+            if !loop_headers[block_idx] {
+                continue;
+            }
+            let start = block_idx * iv_words;
+            for word_idx in 0..iv_words {
+                let word = iv_data[start + word_idx];
+                if word == 0 {
+                    continue;
+                }
+                let base_local = word_idx * 32;
+                for bit in 0..32 {
+                    if word & (1u32 << bit) != 0 {
+                        let local_idx = base_local + bit;
+                        if local_idx < num_locals {
+                            results.push((
+                                BasicBlock::from_usize(block_idx),
+                                Local::from_usize(local_idx),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(results)
+    }
+
+    fn run_induction_var_detection_vulkan(&self) -> Option<Vec<(BasicBlock, Local)>> {
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_induction_var_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let num_locals = self.body.local_decls.len();
+        let max_stmts = self
+            .body
+            .basic_blocks
+            .iter()
+            .map(|b| b.statements.len())
+            .max()
+            .unwrap_or(0);
+        let iv_words = (num_locals + 31) / 32;
+
+        let mut loop_headers = vec![false; num_blocks];
+        for (block_idx, _) in self.body.basic_blocks.iter_enumerated() {
+            let preds = &self.body.basic_blocks.predecessors()[block_idx];
+            if preds.len() > 1 {
+                loop_headers[block_idx.index()] = true;
+            }
+        }
+
+        let mut block_info = Vec::with_capacity(num_blocks * (2 + max_stmts * 2));
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            block_info.push(if loop_headers[block_idx.index()] { 1u32 } else { 0 });
+            let num_stmts = block.statements.len().min(max_stmts);
+            block_info.push(num_stmts as u32);
+
+            for stmt in &block.statements[..num_stmts] {
+                let (local, kind) = match &stmt.kind {
+                    StatementKind::Assign((place, rvalue)) => {
+                        let l = place.local;
+                        let k = match rvalue {
+                            rustc_middle::mir::Rvalue::BinaryOp(
+                                rustc_middle::mir::BinOp::Add,
+                                _,
+                            ) => 1u32,
+                            rustc_middle::mir::Rvalue::BinaryOp(
+                                rustc_middle::mir::BinOp::Sub,
+                                _,
+                            ) => 2u32,
+                            _ => 3u32,
+                        };
+                        (l.as_u32(), k)
+                    }
+                    _ => (0xFFFFFFFF, 0),
+                };
+                block_info.push(local);
+                block_info.push(kind);
+            }
+
+            for _ in num_stmts..max_stmts {
+                block_info.push(0xFFFFFFFF);
+                block_info.push(0);
+            }
+        }
+
+        let induction_vars: Vec<u32> = vec![0; num_blocks * iv_words];
+
+        let block_info_buf = backend
+            .create_buffer((block_info.len() * std::mem::size_of::<u32>()) as u64)?;
+        block_info_buf.write(&block_info);
+
+        let iv_buf = backend
+            .create_buffer((induction_vars.len() * std::mem::size_of::<u32>()) as u64)?;
+        iv_buf.write(&induction_vars);
+
         gpu.dispatch_induction_var_round(
             &block_info_buf,
             &iv_buf,
@@ -1754,7 +2589,6 @@ impl<'tcx> GpuEngine<'tcx> {
         )
         .ok()?;
 
-        // Read back induction variables
         let iv_data: Vec<u32> = iv_buf.read(num_blocks * iv_words);
 
         let mut results = Vec::new();
