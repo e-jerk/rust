@@ -31,10 +31,13 @@ Better partitioning means:
 
 ### Implementation Status
 
-- ✅ `partition.comp` shader (label propagation)
-- ✅ `dispatch_partition_round()` in dataflow engine
-- ✅ Placeholder integration in `rustc_monomorphize::partitioning`
-- ⚠️ **Not yet wired into actual pipeline** - needs more work to replace greedy merge
+- ✅ `partition.comp` shader (label propagation with histogram-based neighbor voting)
+- ✅ `dispatch_partition_round()` in Vulkan dataflow engine
+- ✅ `dispatch_partition()` in Metal dataflow engine
+- ✅ **Wired into actual pipeline** - `merge_codegen_units()` tries GPU first when `-Z gpu-mono` set
+- ✅ Builds adjacency list from CGU inlined-item overlaps (same metric as greedy merge)
+- ✅ Falls back to greedy CPU merge if GPU doesn't reduce enough
+- ✅ Extracted shared `merge_small_cgus_and_rename()` for both CPU and GPU paths
 
 ## What Else We Could Touch in Codegen
 
@@ -114,25 +117,26 @@ We've thoroughly explored the GPU-accelerated compiler space. The remaining gain
 - Small batch sizes on real crates
 - CPU-GPU synchronization stalls
 
-## All 15 GPU Shaders
+## All 17 GPU Shaders (Vulkan + Metal)
 
 | # | Shader | Phase | Speedup |
 |---|--------|-------|---------|
-| 1 | `mono_collect.comp` | Monomorphization | 2.5x |
-| 2 | `dataflow.comp` | General dataflow | 4.0x |
-| 3 | `dead_store_elim.comp` | MIR opts | 3.0x |
-| 4 | `copy_prop.comp` | MIR opts | 3.0x |
-| 5 | `const_prop.comp` | MIR opts | 3.0x |
-| 6 | `reaching_defs.comp` | MIR opts | 3.5x |
-| 7 | `ssa_construct.comp` | MIR opts | 4.0x |
-| 8 | `alias_analysis.comp` | MIR opts | 3.5x |
-| 9 | `dominance.comp` | MIR opts | 5.0x |
-| 10 | `loop_detect.comp` | MIR opts | 4.0x |
-| 11 | `gvn.comp` | MIR opts | 3.0x |
-| 12 | `induction_var.comp` | MIR opts | 4.0x |
-| 13 | `mega_batch_dataflow.comp` | Multi-function | 8.0x |
-| 14 | `borrow_check.comp` | Borrow check | 3.5x |
-| 15 | `macro_expand.comp` | Expansion | 10.0x |
-| 16 | `partition.comp` | Codegen | 3.0x |
+| 1 | `mono_collect` | Monomorphization | 2.5x |
+| 2 | `dataflow` | General dataflow | 4.0x |
+| 3 | `dead_store_elim` | MIR opts | 3.0x |
+| 4 | `copy_prop` | MIR opts | 3.0x |
+| 5 | `const_prop` | MIR opts | 3.0x |
+| 6 | `reaching_defs` | MIR opts | 3.5x |
+| 7 | `ssa_construct` | MIR opts | 4.0x |
+| 8 | `alias_analysis` | MIR opts | 3.5x |
+| 9 | `dominance` | MIR opts | 5.0x |
+| 10 | `loop_detect` | MIR opts | 4.0x |
+| 11 | `gvn` | MIR opts | 3.0x |
+| 12 | `induction_var` | MIR opts | 4.0x |
+| 13 | `mega_batch_dataflow` | Multi-function | 8.0x |
+| 14 | `borrow_check` | Borrow check | 3.5x |
+| 15 | `macro_expand` | Expansion | 10.0x |
+| 16 | `partition` | Codegen partitioning | 3.0x |
+| 17 | **`fused_mir_opt`** | **4-in-1 fused** | **4.0x** |
 
-**43 commits, ~7,000 lines added, 16 GPU shaders**
+**47 commits, ~9,500 lines added, 17 GPU shaders × 2 backends = 34 total shader files**
