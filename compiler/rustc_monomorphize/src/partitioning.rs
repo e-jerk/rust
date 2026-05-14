@@ -1440,11 +1440,11 @@ fn gpu_partition_codegen_units_metal<'tcx>(
 ) -> Option<Vec<CodegenUnit<'tcx>>> {
     let backend = rustc_gpu_metal::MetalBackend::new()?;
     let metallib_path = rustc_gpu_metal::load_partition_shader()?;
-    let engine = rustc_gpu_metal::dataflow::MetalDataflowEngine::new(
+    let pipeline = backend.get_pipeline(&metallib_path, "partition")?;
+    let mut engine = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
         &backend.context,
-        &metallib_path,
-        "partition",
-    ).ok()?;
+        pipeline,
+    );
 
     let num_nodes = codegen_units.len();
     let mut edge_list = Vec::new();
