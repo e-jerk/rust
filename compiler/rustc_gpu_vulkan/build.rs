@@ -56,4 +56,9 @@ fn main() {
         &out_dir,
         "COPY_PROP_SPV",
     );
+    compile_shader(
+        "src/shaders/const_prop.comp",
+        &out_dir,
+        "CONST_PROP_SPV",
+    );
 }

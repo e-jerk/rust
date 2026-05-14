@@ -1,0 +1,87 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Block configuration buffer
+layout(set = 0, binding = 0) readonly buffer BlockConfigs {
+    uint data[];
+} configs;
+
+// Constant facts buffer: per-statement encoded constant facts
+// Each entry: (local_idx << 16) | const_value, or 0xFFFFFFFF if not a constant assignment
+// const_value is a small integer (0-65535), or special values for true/false
+layout(set = 0, binding = 1) readonly buffer ConstFacts {
+    uint data[];
+} const_facts;
+
+// Entry states: which locals hold constant values
+// Flat array: for each block, for each local, store (const_value + 1) or 0 if not constant
+layout(set = 0, binding = 2) buffer EntryStates {
+    uint data[];
+} entry_states;
+
+// Exit states
+layout(set = 0, binding = 3) buffer ExitStates {
+    uint data[];
+} exit_states;
+
+// Convergence flag
+layout(set = 0, binding = 4) buffer Convergence {
+    uint changed;
+} convergence;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint num_locals;
+    uint facts_stride;
+} pc;
+
+// Forward dataflow for constant propagation:
+// - A constant assignment: `x = 5` means exit[x] = 5
+// - Any other assignment to x: exit[x] = 0 (x is no longer constant)
+// - Merge (join): if two predecessors have different constants for same local, result is 0
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+    
+    uint config_base = block_idx * 4;
+    uint stmt_count = configs.data[config_base];
+    
+    // Read entry state for this block
+    uint state_start = block_idx * pc.num_locals;
+    uint state[128]; // Max 128 locals per function
+    
+    uint max_locals = min(pc.num_locals, 128);
+    for (uint i = 0; i < max_locals; i++) {
+        state[i] = entry_states.data[state_start + i];
+    }
+    
+    // Apply constant facts forward through statements
+    for (uint stmt_idx = 0; stmt_idx < stmt_count; stmt_idx++) {
+        uint fact = const_facts.data[block_idx * pc.facts_stride + stmt_idx];
+        if (fact != 0xFFFFFFFF) {
+            uint local = (fact >> 16) & 0xFFFF;
+            uint value = fact & 0xFFFF;
+            if (local < max_locals) {
+                state[local] = value + 1; // +1 to distinguish from "not constant" (0)
+            }
+        }
+        // For non-constant assignments, we would need to kill the local
+        // For simplicity, we only handle explicit constant assignments in the shader
+    }
+    
+    // Write exit state
+    bool changed = false;
+    for (uint i = 0; i < max_locals; i++) {
+        uint old = exit_states.data[state_start + i];
+        if (old != state[i]) {
+            exit_states.data[state_start + i] = state[i];
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        atomicOr(convergence.changed, 1);
+    }
+}

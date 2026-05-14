@@ -674,4 +674,222 @@ impl<'tcx> GpuEngine<'tcx> {
 
         propagations
     }
+
+    // ------------------------------------------------------------------
+    // GPU-accelerated Constant Propagation (forward dataflow)
+    // ------------------------------------------------------------------
+
+    /// Run constant propagation analysis on GPU.
+    ///
+    /// Returns a vector of (block, statement_idx, local, constant_value) for assignments
+    /// that can be constant-folded.
+    pub fn run_constant_propagation(&self) -> Option<Vec<(BasicBlock, usize, Local, u32)>> {
+        if self.body.basic_blocks.len() < 50 {
+            return None;
+        }
+
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_const_prop_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let num_locals = self.body.local_decls.len();
+
+        // Serialize constant facts
+        let (configs, const_facts, facts_stride) = self.serialize_const_facts();
+
+        // Initialize entry states to 0 (no known constants)
+        let entry_states: Vec<u32> = vec![0; num_blocks * num_locals];
+        let exit_states: Vec<u32> = vec![0; num_blocks * num_locals];
+
+        let config_buf = backend
+            .create_buffer((configs.len() * std::mem::size_of::<u32>()) as u64)?;
+        config_buf.write(&configs);
+
+        let facts_buf = backend
+            .create_buffer((const_facts.len() * std::mem::size_of::<u32>()) as u64)?;
+        facts_buf.write(&const_facts);
+
+        let entry_buf = backend
+            .create_buffer((entry_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        entry_buf.write(&entry_states);
+
+        let exit_buf = backend
+            .create_buffer((exit_states.len() * std::mem::size_of::<u32>()) as u64)?;
+        exit_buf.write(&exit_states);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
+        // Forward fixed-point iteration on GPU
+        let mut round = 0;
+        const MAX_ROUNDS: u32 = 200;
+
+        loop {
+            convergence_buf.write(&[0u32]);
+
+            // GPU computes exit states from entry states
+            gpu.dispatch_round(
+                &config_buf,
+                &facts_buf,
+                &entry_buf,
+                &exit_buf,
+                &convergence_buf,
+                num_blocks as u32,
+                num_locals as u32,
+                facts_stride,
+            )
+            .ok()?;
+
+            let changed = gpu.read_convergence(&convergence_buf);
+            round += 1;
+
+            if !changed || round >= MAX_ROUNDS {
+                break;
+            }
+
+            // Propagate exit states to successor entry states on CPU
+            let exit_data: Vec<u32> = exit_buf.read(num_blocks * num_locals);
+            let mut entry_data: Vec<u32> = entry_buf.read(num_blocks * num_locals);
+            self.propagate_const_edges(&exit_data, &mut entry_data);
+            entry_buf.write(&entry_data);
+        }
+
+        // Read back final states
+        let final_entry: Vec<u32> = entry_buf.read(num_blocks * num_locals);
+        Some(self.identify_constant_propagations(&final_entry))
+    }
+
+    /// Serialize block configs and constant facts for constant propagation.
+    fn serialize_const_facts(&self) -> (Vec<u32>, Vec<u32>, u32) {
+        let num_blocks = self.body.basic_blocks.len();
+        let max_statements = self
+            .body
+            .basic_blocks
+            .iter()
+            .map(|b| b.statements.len())
+            .max()
+            .unwrap_or(0) as u32;
+
+        let mut configs = Vec::with_capacity(num_blocks * 4);
+        let mut facts = vec![0xFFFFFFFFu32; num_blocks * max_statements as usize];
+
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            let terminator = block.terminator();
+            let successors: Vec<BasicBlock> = terminator.successors().collect();
+
+            let terminator_kind = match terminator.kind {
+                TerminatorKind::Goto { .. } => 0,
+                TerminatorKind::SwitchInt { .. } => 1,
+                TerminatorKind::Return => 2,
+                TerminatorKind::Unreachable => 3,
+                TerminatorKind::Call { .. } => 4,
+                TerminatorKind::Drop { .. } => 5,
+                _ => 6,
+            };
+
+            configs.push(block.statements.len() as u32);
+            configs.push(terminator_kind);
+            configs.push(
+                (successors.len() as u32 & 0xFFFF)
+                    | ((successors.get(0).map_or(u32::MAX, |b| b.as_u32()) & 0xFFFF) << 16),
+            );
+            configs.push(
+                successors.get(1).map_or(u32::MAX, |b| b.as_u32() & 0xFFFF),
+            );
+
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
+                    if let rustc_middle::mir::Rvalue::Use(rustc_middle::mir::Operand::Constant(cst), _) = rvalue {
+                        if let Some(dst_local) = place.as_local() {
+                            // Try to extract a small integer constant (0-65534)
+                            let value = match cst.const_ {
+                                rustc_middle::mir::Const::Val(val, _) => {
+                                    if let Some(scalar) = val.try_to_scalar_int() {
+                                        let v = scalar.to_u32();
+                                        if v <= 65534 { v } else { continue; }
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                rustc_middle::mir::Const::Ty(_, ty_const) => {
+                                    if let Some(scalar) = ty_const.try_to_leaf() {
+                                        let v = scalar.to_u32();
+                                        if v <= 65534 { v } else { continue; }
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                _ => continue,
+                            };
+                            let encoded = ((dst_local.as_u32() & 0xFFFF) << 16) | (value & 0xFFFF);
+                            facts[block_idx.index() * max_statements as usize + stmt_idx] = encoded;
+                        }
+                    }
+                }
+            }
+        }
+
+        (configs, facts, max_statements)
+    }
+
+    /// Propagate exit constant states to successor entry states.
+    fn propagate_const_edges(&self, exit_states: &[u32], entry_states: &mut [u32]) {
+        let num_locals = self.body.local_decls.len();
+
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            let exit_start = block_idx.index() * num_locals;
+
+            for succ in block.terminator().successors() {
+                let succ_idx = succ.index();
+                let entry_start = succ_idx * num_locals;
+
+                for l in 0..num_locals {
+                    let exit_val = exit_states[exit_start + l];
+                    let entry_val = entry_states[entry_start + l];
+
+                    // Join: if both agree, keep the value; otherwise, mark as unknown (0)
+                    if entry_val == 0 {
+                        entry_states[entry_start + l] = exit_val;
+                    } else if entry_val != exit_val {
+                        entry_states[entry_start + l] = 0; // conflicting constants -> unknown
+                    }
+                }
+            }
+        }
+    }
+
+    /// Identify constant assignments that can be propagated.
+    fn identify_constant_propagations(
+        &self,
+        entry_states: &[u32],
+    ) -> Vec<(BasicBlock, usize, Local, u32)> {
+        let num_locals = self.body.local_decls.len();
+        let mut propagations = Vec::new();
+
+        for (block_idx, block) in self.body.basic_blocks.iter_enumerated() {
+            let entry_start = block_idx.index() * num_locals;
+
+            for (stmt_idx, stmt) in block.statements.iter().enumerate() {
+                // Check if this statement uses a local that holds a constant
+                // For simplicity, we look for Rvalues that are copies of locals
+                if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
+                    if let rustc_middle::mir::Rvalue::Use(rustc_middle::mir::Operand::Copy(src) |
+                        rustc_middle::mir::Operand::Move(src), _) = rvalue {
+                        if let Some(src_local) = src.as_local() {
+                            let const_val = entry_states[entry_start + src_local.as_usize()];
+                            if const_val > 0 {
+                                // src holds constant (const_val - 1)
+                                let value = const_val - 1;
+                                if let Some(dst_local) = place.as_local() {
+                                    propagations.push((block_idx, stmt_idx, dst_local, value));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        propagations
+    }
 }
