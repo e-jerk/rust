@@ -76,4 +76,9 @@ fn main() {
         &out_dir,
         "ALIAS_ANALYSIS_SPV",
     );
+    compile_shader(
+        "src/shaders/dominance.comp",
+        &out_dir,
+        "DOMINANCE_SPV",
+    );
 }

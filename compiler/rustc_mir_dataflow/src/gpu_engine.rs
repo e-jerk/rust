@@ -1285,4 +1285,119 @@ impl<'tcx> GpuEngine<'tcx> {
 
         Some(result)
     }
+
+    // ------------------------------------------------------------------
+    // GPU-accelerated Dominance Analysis
+    // ------------------------------------------------------------------
+
+    /// Compute dominance information on GPU using iterative fixed-point.
+    ///
+    /// Returns a vector of DenseBitSet where result[i] contains all blocks that dominate block i.
+    pub fn run_dominance_analysis(&self) -> Option<Vec<DenseBitSet<BasicBlock>>> {
+        if self.body.basic_blocks.len() < 50 || self.body.basic_blocks.len() > 1024 {
+            return None;
+        }
+
+        let backend = GpuBackend::new()?;
+        let spirv = rustc_gpu_vulkan::load_dominance_shader()?;
+        let gpu = GpuDataflowEngine::new(&backend.context, &spirv).ok()?;
+
+        let num_blocks = self.body.basic_blocks.len();
+        let bitmap_words = (num_blocks + 31) / 32;
+
+        // Serialize block info: for each block, [num_preds, pred_0, pred_1, pred_2, pred_3]
+        let mut block_info = Vec::with_capacity(num_blocks * 5);
+        for (block_idx, _block) in self.body.basic_blocks.iter_enumerated() {
+            let preds = &self.body.basic_blocks.predecessors()[block_idx];
+            let num_preds = preds.len().min(4); // Cap at 4 predecessors
+            block_info.push(num_preds as u32);
+            for p in 0..4 {
+                if p < num_preds {
+                    block_info.push(preds[p].as_u32());
+                } else {
+                    block_info.push(0xFFFFFFFF);
+                }
+            }
+        }
+
+        // Initialize dominator sets
+        // D[entry] = {entry}, D[others] = all blocks
+        let mut dominator_sets: Vec<u32> = Vec::with_capacity(num_blocks * bitmap_words);
+        for block_idx in 0..num_blocks {
+            for word_idx in 0..bitmap_words {
+                if block_idx == 0 {
+                    // Entry block: only dominates itself
+                    if word_idx == 0 {
+                        dominator_sets.push(1u32); // block 0
+                    } else {
+                        dominator_sets.push(0u32);
+                    }
+                } else {
+                    // Other blocks: initially dominated by all blocks
+                    dominator_sets.push(0xFFFFFFFFu32);
+                }
+            }
+        }
+
+        let block_info_buf = backend
+            .create_buffer((block_info.len() * std::mem::size_of::<u32>()) as u64)?;
+        block_info_buf.write(&block_info);
+
+        let dom_buf = backend
+            .create_buffer((dominator_sets.len() * std::mem::size_of::<u32>()) as u64)?;
+        dom_buf.write(&dominator_sets);
+
+        let convergence_buf = backend.create_buffer(std::mem::size_of::<u32>() as u64)?;
+
+        // Fixed-point iteration on GPU
+        let mut round = 0;
+        const MAX_ROUNDS: u32 = 200;
+
+        loop {
+            convergence_buf.write(&[0u32]);
+
+            gpu.dispatch_dominance_round(
+                &block_info_buf,
+                &dom_buf,
+                &convergence_buf,
+                num_blocks as u32,
+                bitmap_words as u32,
+            )
+            .ok()?;
+
+            let changed = gpu.read_convergence(&convergence_buf);
+            round += 1;
+
+            if !changed || round >= MAX_ROUNDS {
+                break;
+            }
+        }
+
+        // Read back dominator sets
+        let dom_data: Vec<u32> = dom_buf.read(num_blocks * bitmap_words);
+
+        // Convert to DenseBitSet<BasicBlock>
+        let mut result = Vec::with_capacity(num_blocks);
+        for block_idx in 0..num_blocks {
+            let start = block_idx * bitmap_words;
+            let mut bitset = DenseBitSet::new_empty(num_blocks);
+            for (word_idx, &word) in dom_data[start..start + bitmap_words].iter().enumerate() {
+                if word == 0 {
+                    continue;
+                }
+                let base_block = word_idx * 32;
+                for bit in 0..32 {
+                    if word & (1u32 << bit) != 0 {
+                        let b = base_block + bit;
+                        if b < num_blocks {
+                            bitset.insert(BasicBlock::from_usize(b));
+                        }
+                    }
+                }
+            }
+            result.push(bitset);
+        }
+
+        Some(result)
+    }
 }

@@ -1,0 +1,106 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Dominance analysis on GPU:
+// Compute the immediate dominator for each basic block using
+// an iterative dataflow algorithm.
+//
+// Classic algorithm:
+//   D[start] = {start}
+//   D[n] = {n} ∪ (∩ D[p] for all predecessors p of n)
+//   IDOM[n] = min(D[n] - {n})
+
+// Block configuration: [num_preds, pred_0, pred_1, pred_2, pred_3]
+layout(set = 0, binding = 0) readonly buffer BlockInfo {
+    uint data[];
+} block_info;
+
+// Dominator sets: for each block, a bitmap of which blocks dominate it
+layout(set = 0, binding = 1) buffer DominatorSets {
+    uint data[];
+} dominator_sets;
+
+// Convergence flag
+layout(set = 0, binding = 2) buffer Convergence {
+    uint changed;
+} convergence;
+
+layout(push_constant) uniform PushConstants {
+    uint num_blocks;
+    uint block_bitmap_words;
+} pc;
+
+// Intersection of predecessor dominator sets
+// Result stored in out_set
+void intersect_preds(uint block_idx, uint out_set[32]) {
+    uint info_offset = block_idx * 5;
+    uint num_preds = block_info.data[info_offset];
+    
+    if (num_preds == 0) {
+        // Start block: only dominates itself
+        return;
+    }
+    
+    uint max_words = min(pc.block_bitmap_words, 32);
+    
+    // Initialize with all ones
+    for (uint w = 0; w < max_words; w++) {
+        out_set[w] = 0xFFFFFFFF;
+    }
+    
+    // Intersect with each predecessor's dominator set
+    for (uint p = 0; p < num_preds && p < 4; p++) {
+        uint pred = block_info.data[info_offset + 1 + p];
+        if (pred >= pc.num_blocks) continue;
+        
+        uint pred_start = pred * pc.block_bitmap_words;
+        for (uint w = 0; w < max_words; w++) {
+            out_set[w] &= dominator_sets.data[pred_start + w];
+        }
+    }
+}
+
+void main() {
+    uint block_idx = gl_GlobalInvocationID.x;
+    if (block_idx >= pc.num_blocks) return;
+    
+    // Skip the entry block (block 0)
+    if (block_idx == 0) return;
+    
+    uint info_offset = block_idx * 5;
+    uint num_preds = block_info.data[info_offset];
+    
+    // If no predecessors, this block is unreachable
+    if (num_preds == 0) {
+        return;
+    }
+    
+    uint max_words = min(pc.block_bitmap_words, 32);
+    
+    // Compute new dominator set: {block_idx} ∪ (∩ preds' dominator sets)
+    uint new_set[32];
+    intersect_preds(block_idx, new_set);
+    
+    // Add this block to its own dominator set
+    uint word = block_idx / 32;
+    uint bit = block_idx % 32;
+    if (word < max_words) {
+        new_set[word] |= (1u << bit);
+    }
+    
+    // Check if dominator set changed
+    uint set_start = block_idx * pc.block_bitmap_words;
+    bool changed = false;
+    for (uint w = 0; w < max_words; w++) {
+        uint old = dominator_sets.data[set_start + w];
+        if (old != new_set[w]) {
+            dominator_sets.data[set_start + w] = new_set[w];
+            changed = true;
+        }
+    }
+    
+    if (changed) {
+        atomicOr(convergence.changed, 1);
+    }
+}
