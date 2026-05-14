@@ -2352,6 +2352,8 @@ options! {
     graphviz_font: String = ("Courier, monospace".to_string(), parse_string, [UNTRACKED],
         "use the given `fontname` in graphviz output; can be overridden by setting \
         environment variable `RUSTC_GRAPHVIZ_FONT` (default: `Courier, monospace`)"),
+    gpu_mono: bool = (false, parse_bool, [UNTRACKED],
+        "experimental: use Vulkan compute shaders for monomorphization collection"),
     has_thread_local: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "explicitly enable the `cfg(target_thread_local)` directive"),
     help: bool = (false, parse_no_value, [UNTRACKED], "Print unstable compiler options"),
