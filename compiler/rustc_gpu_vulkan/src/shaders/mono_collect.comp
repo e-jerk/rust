@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer Actions {
+    uint data[];
+} actions;
+
+layout(set = 0, binding = 1) readonly buffer Offsets {
+    uint data[];
+} body_offsets;
+
+layout(set = 0, binding = 2) writeonly buffer Edges {
+    uint def_id;
+    uint args_idx;
+} edges[];
+
+layout(set = 0, binding = 3) buffer EdgeCounter {
+    uint count;
+} edge_counter;
+
+layout(push_constant) uniform PushConstants {
+    uint num_bodies;
+} pc;
+
+#define ACTION_CALL 1
+#define ACTION_DROP 2
+#define ACTION_CAST 3
+#define ACTION_CONST 4
+
+void main() {
+    uint body_idx = gl_GlobalInvocationID.x;
+    if (body_idx >= pc.num_bodies) return;
+    
+    uint offset = body_offsets.data[body_idx];
+    uint end = body_offsets.data[body_idx + 1];
+    
+    for (uint i = offset; i < end; i += 4) {
+        uint kind = actions.data[i];
+        uint def_id = actions.data[i + 1];
+        uint args_idx = actions.data[i + 2];
+        // uint reserved = actions.data[i + 3]; // padding
+        
+        if (kind == ACTION_CALL || kind == ACTION_DROP || kind == ACTION_CAST) {
+            uint edge_idx = atomicAdd(edge_counter.count, 1);
+            edges[edge_idx].def_id = def_id;
+            edges[edge_idx].args_idx = args_idx;
+        }
+    }
+}

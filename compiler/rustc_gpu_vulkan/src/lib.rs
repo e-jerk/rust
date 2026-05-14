@@ -21,3 +21,11 @@ impl GpuBackend {
         Some(GpuBackend { context: Arc::new(context) })
     }
 }
+
+pub fn load_mono_collect_shader() -> Option<Vec<u8>> {
+    if let Ok(spv_path) = std::env::var("MONO_COLLECT_SPV") {
+        std::fs::read(spv_path).ok()
+    } else {
+        None
+    }
+}
