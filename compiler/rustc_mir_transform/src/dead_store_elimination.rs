@@ -39,11 +39,11 @@ fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> bool {
 
     // Try GPU-accelerated liveness first when -Z gpu-mono is enabled and function is large enough.
     // This offloads the expensive backward dataflow fixed-point iteration to the GPU.
-    if tcx.sess.opts.unstable_opts.gpu_mono && body.basic_blocks.len() >= 50 {
-        if let Some(gpu_dead_stores) =
-            rustc_mir_dataflow::gpu_engine::GpuEngine::new(tcx, body)
-                .and_then(|engine| engine.run_backward_liveness_for_dse())
-        {
+    let gpu_patch: Option<Vec<(Location, bool)>> = if tcx.sess.opts.unstable_opts.gpu_mono && body.basic_blocks.len() >= 50 {
+        // Scope the GpuEngine so it is dropped before we mutate body
+        let gpu_result = (|| {
+            let engine = rustc_mir_dataflow::gpu_engine::GpuEngine::new(tcx, body)?;
+            let gpu_dead_stores = engine.run_backward_liveness_for_dse()?;
             let mut patch = Vec::new();
             for (bb, stmt_idx) in gpu_dead_stores {
                 let statement = &body.basic_blocks[bb].statements[stmt_idx];
@@ -62,16 +62,22 @@ fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> bool {
                     patch.push((loc, drop_debuginfo));
                 }
             }
+            Some(patch)
+        })();
+        gpu_result
+    } else {
+        None
+    };
 
-            if !patch.is_empty() {
-                let bbs = body.basic_blocks.as_mut_preserves_cfg();
-                for (Location { block, statement_index }, drop_debuginfo) in patch {
-                    bbs[block].statements[statement_index].make_nop(drop_debuginfo);
-                }
-                return true;
+    if let Some(patch) = gpu_patch {
+        if !patch.is_empty() {
+            let bbs = body.basic_blocks.as_mut_preserves_cfg();
+            for (Location { block, statement_index }, drop_debuginfo) in patch {
+                bbs[block].statements[statement_index].make_nop(drop_debuginfo);
             }
-            // GPU found no dead stores; fall through to CPU path for call-operand promotion.
+            return true;
         }
+        // GPU found no dead stores; fall through to CPU path for call-operand promotion.
     }
 
     let mut live = MaybeTransitiveLiveLocals::new(&borrowed_locals, &debuginfo_locals)

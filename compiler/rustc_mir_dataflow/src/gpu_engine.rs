@@ -12,17 +12,17 @@ use rustc_middle::ty::TyCtxt;
 ///
 /// Only large functions (>100 basic blocks) are considered,
 /// and only a simplified liveness-like analysis is supported.
-pub struct GpuEngine<'tcx> {
+pub struct GpuEngine<'a, 'tcx> {
     _tcx: TyCtxt<'tcx>,
-    body: &'tcx Body<'tcx>,
+    body: &'a Body<'tcx>,
 }
 
-impl<'tcx> GpuEngine<'tcx> {
+impl<'a, 'tcx> GpuEngine<'a, 'tcx> {
     /// Try to construct a GPU engine for the given function body.
     ///
     /// Returns `None` if the body is too small to benefit from GPU
     /// offload or if the GPU backend is unavailable.
-    pub fn new(tcx: TyCtxt<'tcx>, body: &'tcx Body<'tcx>) -> Option<Self> {
+    pub fn new(tcx: TyCtxt<'tcx>, body: &'a Body<'tcx>) -> Option<Self> {
         // Only enable for large functions (>100 basic blocks)
         if body.basic_blocks.len() < 100 {
             return None;

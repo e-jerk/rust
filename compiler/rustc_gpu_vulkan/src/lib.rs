@@ -1,4 +1,5 @@
 #![allow(internal_features)]
+#![allow(rustc::default_hash_types)]
 
 pub mod buffer;
 pub mod context;
@@ -130,138 +131,12 @@ pub fn load_partition_shader() -> Option<Vec<u8>> {
     load_spv_cached("PARTITION_SPV")
 }
 
+pub fn load_borrow_check_shader() -> Option<Vec<u8>> {
+    load_spv_cached("BORROW_CHECK_SPV")
+}
+
 pub fn load_fused_mir_opt_shader() -> Option<Vec<u8>> {
     load_spv_cached("FUSED_MIR_OPT_SPV")
-}
-}
-
-pub fn load_dataflow_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("DATAFLOW_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_dead_store_elim_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("DEAD_STORE_ELIM_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_copy_prop_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("COPY_PROP_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_const_prop_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("CONST_PROP_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_reaching_defs_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("REACHING_DEFS_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_ssa_construct_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("SSA_CONSTRUCT_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_alias_analysis_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("ALIAS_ANALYSIS_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_dominance_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("DOMINANCE_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_loop_detect_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("LOOP_DETECT_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_gvn_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("GVN_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_induction_var_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("INDUCTION_VAR_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_mega_batch_dataflow_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("MEGA_BATCH_DATAFLOW_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_macro_expand_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("MACRO_EXPAND_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_borrow_check_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("BORROW_CHECK_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-pub fn load_partition_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("PARTITION_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
-}
-
-/// Load the fused MIR optimization shader (4 analyses in 1 dispatch).
-pub fn load_fused_mir_opt_shader() -> Option<Vec<u8>> {
-    if let Ok(spv_path) = std::env::var("FUSED_MIR_OPT_SPV") {
-        std::fs::read(spv_path).ok()
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

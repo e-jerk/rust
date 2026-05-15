@@ -1441,7 +1441,7 @@ fn gpu_partition_codegen_units_metal<'tcx>(
     let backend = rustc_gpu_metal::MetalBackend::new()?;
     let metallib_path = rustc_gpu_metal::load_partition_shader()?;
     let pipeline = backend.get_pipeline(&metallib_path, "partition")?;
-    let mut engine = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
+    let engine = rustc_gpu_metal::dataflow::MetalDataflowEngine::from_pipeline(
         &backend.context,
         pipeline,
     );
@@ -1617,11 +1617,14 @@ fn build_merged_cgus<'tcx>(
     for (_label, indices) in label_to_cgus {
         if indices.is_empty() { continue; }
 
-        let mut merged = codegen_units[indices[0]].clone();
+        let first_idx = indices[0];
+        let mut merged = CodegenUnit::new(codegen_units[first_idx].name());
+        merged.items_mut().clone_from(codegen_units[first_idx].items());
 
         for &idx in indices.iter().skip(1) {
-            let src = &codegen_units[idx];
-            merged.items_mut().append(src.items_mut());
+            for (item, data) in codegen_units[idx].items() {
+                merged.items_mut().entry(*item).or_insert(*data);
+            }
         }
         merged.compute_size_estimate();
 

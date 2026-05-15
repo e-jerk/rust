@@ -296,7 +296,6 @@ fn gpu_collect_mono_items_metal<'tcx>(
         // Prepare and dispatch up to BATCH_COUNT batches simultaneously
         if !queue.is_empty() {
             let mut batch_dispatches = Vec::new();
-            let mut num_batches = 0;
             
             for batch_idx in 0..BATCH_COUNT {
                 if queue.is_empty() { break; }
@@ -321,7 +320,6 @@ fn gpu_collect_mono_items_metal<'tcx>(
                 ));
                 
                 next_batches.push((batch, serialized));
-                num_batches += 1;
             }
             
             // Dispatch all batches in a single command buffer

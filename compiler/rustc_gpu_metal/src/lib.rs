@@ -1,3 +1,5 @@
+#![allow(rustc::default_hash_types)]
+
 pub mod buffer;
 pub mod context;
 pub mod dataflow;
@@ -6,6 +8,10 @@ pub mod dispatch;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+// Silence unused crate warnings (crates are used through transitive deps via `metal` crate)
+use cocoa as _;
+use objc as _;
 
 thread_local! {
     static METAL_BACKEND: RefCell<Option<MetalBackend>> = RefCell::new(None);
