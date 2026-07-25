@@ -11,7 +11,7 @@ use rustc_abi::{self as abi, Align, CanonAbi, Size, WrappingRange};
 use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::common::{IntPredicate, RealPredicate, SynchronizationScope, TypeKind};
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
-use rustc_codegen_ssa::mir::place::PlaceRef;
+use rustc_codegen_ssa::mir::place::{PlaceRef, PlaceValue};
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_hir::attrs::{AttributeKind, UnrollAttr};
@@ -785,6 +785,9 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
 
             let llval = const_llval.unwrap_or_else(|| {
                 let load = self.load(llty, place.val.llval, place.val.align);
+                if !place.val.raw_deref {
+                    self.set_filc_safe(load);
+                }
                 if let abi::BackendRepr::Scalar(scalar) = place.layout.backend_repr {
                     scalar_load_metadata(self, load, scalar, place.layout, Size::ZERO);
                     self.to_immediate_scalar(load, scalar)
@@ -802,6 +805,9 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
                 };
                 let llty = place.layout.scalar_pair_element_llvm_type(self, i, false);
                 let load = self.load(llty, llptr, align);
+                if !place.val.raw_deref {
+                    self.set_filc_safe(load);
+                }
                 scalar_load_metadata(self, load, scalar, layout, offset);
                 self.to_immediate_scalar(load, scalar)
             };
@@ -853,6 +859,14 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
 
     fn nonnull_metadata(&mut self, load: &'ll Value) {
         self.set_metadata_node(load, llvm::MD_nonnull, &[]);
+    }
+
+    fn set_filc_safe(&mut self, inst: &'ll Value) {
+        if !self.cx.sess().opts.unstable_opts.fil_c {
+            return;
+        }
+        let id = self.get_md_kind_id("filc.safe");
+        self.set_metadata_node(inst, id, &[]);
     }
 
     fn store(&mut self, val: &'ll Value, ptr: &'ll Value, align: Align) -> &'ll Value {
@@ -917,6 +931,9 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
                 let id = self.get_md_kind_id("captures");
                 let md = llvm::LLVMMDNodeInContext2(self.cx.llcx, args.as_ptr(), args.len());
                 self.set_metadata(store, id, md);
+            }
+            if flags.contains(MemFlags::FILC_SAFE) {
+                self.set_filc_safe(store);
             }
             store
         }
@@ -1179,6 +1196,10 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         if let Some(tt) = tt {
             crate::typetree::add_tt(self, memcpy, tt);
         }
+
+        if flags.contains(MemFlags::FILC_SAFE) {
+            self.set_filc_safe(memcpy);
+        }
     }
 
     fn memmove(
@@ -1193,7 +1214,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         assert!(!flags.contains(MemFlags::NONTEMPORAL), "non-temporal memmove not supported");
         let size = self.intcast(size, self.type_isize(), false);
         let is_volatile = flags.contains(MemFlags::VOLATILE);
-        unsafe {
+        let memmove = unsafe {
             llvm::LLVMRustBuildMemMove(
                 self.llbuilder,
                 dst,
@@ -1202,7 +1223,11 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
                 src_align.bytes() as c_uint,
                 size,
                 is_volatile,
-            );
+            )
+        };
+
+        if flags.contains(MemFlags::FILC_SAFE) {
+            self.set_filc_safe(memmove);
         }
     }
 
@@ -1216,7 +1241,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     ) {
         assert!(!flags.contains(MemFlags::NONTEMPORAL), "non-temporal memset not supported");
         let is_volatile = flags.contains(MemFlags::VOLATILE);
-        unsafe {
+        let memset = unsafe {
             llvm::LLVMRustBuildMemSet(
                 self.llbuilder,
                 ptr,
@@ -1224,7 +1249,11 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
                 fill_byte,
                 size,
                 is_volatile,
-            );
+            )
+        };
+
+        if flags.contains(MemFlags::FILC_SAFE) {
+            self.set_filc_safe(memset);
         }
     }
 
@@ -1644,9 +1673,9 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
 
         let mut body_bx = Self::build(self.cx, body_bb);
         let align = dest.val.align.restrict_for_offset(dest.layout.field(self.cx(), 0).size);
-        cg_elem
-            .val
-            .store(&mut body_bx, PlaceRef::new_sized_aligned(current, cg_elem.layout, align));
+        let elem_val =
+            PlaceValue { llval: current, llextra: None, align, raw_deref: dest.val.raw_deref };
+        cg_elem.val.store(&mut body_bx, elem_val.with_type(cg_elem.layout));
 
         let next = body_bx.inbounds_gep(
             self.backend_type(cg_elem.layout),

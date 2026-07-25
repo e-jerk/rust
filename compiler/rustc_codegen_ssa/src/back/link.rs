@@ -3344,16 +3344,17 @@ fn add_upstream_rust_crates(
     for &cnum in &crate_info.used_crates {
         // We may not pass all crates through to the linker. Some crates may appear statically in
         // an existing dylib, meaning we'll pick up all the symbols from the dylib.
-        // We must always link crates `compiler_builtins` and `profiler_builtins` statically.
-        // Even if they were already included into a dylib
+        // We must always link crates `compiler_builtins`, `profiler_builtins`, and `filc_rt`
+        // statically. Even if they were already included into a dylib
         // (e.g. `libstd` when `-C prefer-dynamic` is used).
-        // HACK: `dependency_formats` can report `profiler_builtins` as `NotLinked`.
+        // HACK: `dependency_formats` can report `profiler_builtins`/`filc_rt` as `NotLinked`.
         // See the comment in inject_profiler_runtime for why this is the case.
         let linkage = data[cnum];
         let link_static_crate = linkage == Linkage::Static
             || (linkage == Linkage::IncludedFromDylib || linkage == Linkage::NotLinked)
                 && (crate_info.compiler_builtins == Some(cnum)
-                    || crate_info.profiler_runtime == Some(cnum));
+                    || crate_info.profiler_runtime == Some(cnum)
+                    || crate_info.filc_runtime == Some(cnum));
 
         let mut bundled_libs = Default::default();
         match linkage {

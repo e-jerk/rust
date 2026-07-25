@@ -297,6 +297,7 @@ pub(crate) struct CrateRoot {
     denied_partial_mitigations: LazyArray<DeniedPartialMitigation>,
 
     compiler_builtins: bool,
+    filc_runtime: bool,
     needs_allocator: bool,
     needs_panic_runtime: bool,
     no_builtins: bool,

@@ -270,6 +270,7 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     sym::panic_runtime,
     sym::needs_panic_runtime,
     sym::compiler_builtins,
+    sym::filc_runtime,
     sym::profiler_runtime,
 
     // ==========================================================================

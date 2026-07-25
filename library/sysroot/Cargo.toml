@@ -14,6 +14,7 @@ doc = false
 # this is a dummy crate to ensure that all required crates appear in the sysroot
 [dependencies]
 proc_macro = { path = "../proc_macro", public = true }
+filc_rt = { path = "../filc_rt", optional = true }
 profiler_builtins = { path = "../profiler_builtins", optional = true }
 std = { path = "../std", public = true }
 test = { path = "../test", public = true }
@@ -26,6 +27,7 @@ backtrace-trace-only = ["std/backtrace-trace-only"]
 compiler-builtins-c = ["std/compiler-builtins-c"]
 compiler-builtins-mem = ["std/compiler-builtins-mem"]
 debug_refcell = ["std/debug_refcell"]
+filc = ["dep:filc_rt"]
 llvm-libunwind = ["std/llvm-libunwind"]
 system-llvm-libunwind = ["std/system-llvm-libunwind"]
 optimize_for_size = ["std/optimize_for_size"]

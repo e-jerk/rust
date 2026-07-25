@@ -173,6 +173,9 @@ bitflags::bitflags! {
         /// Only valid on stores of pointers, or pairs where the first element is a pointer.
         /// In the latter case, the flag only applies to the first element of the pair.
         const CAPTURES_READ_ONLY = 1 << 3;
+        /// Indicates that this access is already covered by Rust's compile-time checks,
+        /// so `-Zfil-c` does not need to emit a runtime check for it.
+        const FILC_SAFE = 1 << 4;
     }
 }
 
@@ -286,6 +289,7 @@ pub struct CrateInfo {
     pub linked_symbols: FxIndexMap<CrateType, Vec<(String, SymbolExportKind)>>,
     pub local_crate_name: Symbol,
     pub compiler_builtins: Option<CrateNum>,
+    pub filc_runtime: Option<CrateNum>,
     pub profiler_runtime: Option<CrateNum>,
     pub is_no_builtins: FxHashSet<CrateNum>,
     pub native_libraries: FxIndexMap<CrateNum, Vec<NativeLib>>,

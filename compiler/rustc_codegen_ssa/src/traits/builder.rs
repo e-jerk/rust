@@ -254,7 +254,11 @@ pub trait BuilderMethods<'a, 'tcx>:
     ) -> Self::Value;
     fn load_from_place(&mut self, ty: Self::Type, place: PlaceValue<Self::Value>) -> Self::Value {
         assert_eq!(place.llextra, None);
-        self.load(ty, place.llval, place.align)
+        let load = self.load(ty, place.llval, place.align);
+        if !place.raw_deref {
+            self.set_filc_safe(load);
+        }
+        load
     }
     fn load_operand(&mut self, place: PlaceRef<'tcx, Self::Value>)
     -> OperandRef<'tcx, Self::Value>;
@@ -304,10 +308,22 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn range_metadata(&mut self, load: Self::Value, range: WrappingRange);
     fn nonnull_metadata(&mut self, load: Self::Value);
 
+    /// Records that `inst` only touches memory that Rust has already proven to be
+    /// live and in bounds, so `-Zfil-c` can skip the runtime check for it.
+    ///
+    /// Backends that do not support Fil-C can leave this as a no-op. Note that the
+    /// marking is deliberately opt-out: an unmarked access is checked, so failing
+    /// to mark something costs performance rather than safety.
+    fn set_filc_safe(&mut self, _inst: Self::Value) {}
+
     fn store(&mut self, val: Self::Value, ptr: Self::Value, align: Align) -> Self::Value;
     fn store_to_place(&mut self, val: Self::Value, place: PlaceValue<Self::Value>) -> Self::Value {
         assert_eq!(place.llextra, None);
-        self.store(val, place.llval, place.align)
+        let store = self.store(val, place.llval, place.align);
+        if !place.raw_deref {
+            self.set_filc_safe(store);
+        }
+        store
     }
     fn store_with_flags(
         &mut self,
@@ -323,6 +339,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         flags: MemFlags,
     ) -> Self::Value {
         assert_eq!(place.llextra, None);
+        let flags = if place.raw_deref { flags } else { flags | MemFlags::FILC_SAFE };
         self.store_with_flags(val, place.llval, place.align, flags)
     }
     fn atomic_store(
@@ -508,6 +525,13 @@ pub trait BuilderMethods<'a, 'tcx>:
         assert!(layout.is_sized(), "cannot typed-copy an unsigned type");
         assert!(src.llextra.is_none(), "cannot directly copy from unsized values");
         assert!(dst.llextra.is_none(), "cannot directly copy into unsized values");
+        // A copy reads one side and writes the other, so it can only skip Fil-C's
+        // runtime check when neither end goes through a raw pointer.
+        let flags = if src.raw_deref || dst.raw_deref {
+            flags & !MemFlags::FILC_SAFE
+        } else {
+            flags | MemFlags::FILC_SAFE
+        };
         if flags.contains(MemFlags::NONTEMPORAL) {
             // HACK(nox): This is inefficient but there is no nontemporal memcpy.
             let ty = self.backend_type(layout);

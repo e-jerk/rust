@@ -1830,6 +1830,10 @@ rustc_queries! {
         desc { "checking if the crate has_panic_handler" }
         separate_provide_extern
     }
+    query is_filc_runtime(_: CrateNum) -> bool {
+        desc { "checking if a crate is `#![filc_runtime]`" }
+        separate_provide_extern
+    }
     query is_profiler_runtime(_: CrateNum) -> bool {
         desc { "checking if a crate is `#![profiler_runtime]`" }
         separate_provide_extern

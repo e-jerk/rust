@@ -46,6 +46,7 @@ impl AttributeKind {
             Feature(..) => No,
             FfiConst => No,
             FfiPure(..) => No,
+            FilcRuntime => No,
             Fundamental { .. } => Yes,
             Ignore { .. } => No,
             Inline(..) => No,

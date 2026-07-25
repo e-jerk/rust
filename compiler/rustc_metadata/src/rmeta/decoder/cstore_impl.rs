@@ -352,6 +352,7 @@ provide! { tcx, def_id, other, cdata,
             )).collect()
     }
 
+    is_filc_runtime => { cdata.root.filc_runtime }
     is_profiler_runtime => { cdata.root.profiler_runtime }
     required_panic_strategy => { cdata.root.required_panic_strategy }
     panic_in_drop_strategy => { cdata.root.panic_in_drop_strategy }

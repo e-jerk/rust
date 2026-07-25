@@ -184,6 +184,12 @@ pub(crate) struct NoPanicStrategy {
 }
 
 #[derive(Diagnostic)]
+#[diag("the crate `{$crate_name}` is not a Fil-C runtime")]
+pub(crate) struct NotFilcRuntime {
+    pub crate_name: Symbol,
+}
+
+#[derive(Diagnostic)]
 #[diag("the crate `{$crate_name}` is not a profiler runtime")]
 pub(crate) struct NotProfilerRuntime {
     pub crate_name: Symbol,
@@ -540,6 +546,11 @@ impl<G: EmissionGuarantee> Diagnostic<'_, G> for CannotFindCrate {
             }
         } else if self.crate_name == self.profiler_runtime {
             diag.note(msg!("the compiler may have been built without the profiler runtime"));
+        } else if self.crate_name.as_str() == "filc_rt" {
+            diag.note(msg!(
+                "the standard library may have been built without the Fil-C runtime; \
+                 ensure the sysroot was built with the `filc` feature"
+            ));
         } else if self.crate_name.as_str().starts_with("rustc_") {
             diag.help(msg!("maybe you need to install the missing components with: `rustup component add rust-src rustc-dev llvm-tools-preview`"));
         }

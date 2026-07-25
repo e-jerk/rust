@@ -123,7 +123,7 @@ impl<V: CodegenObject> OperandValue<V> {
     /// This is the inverse of [`PlaceValue::address`].
     pub(crate) fn deref(self, align: Align) -> PlaceValue<V> {
         let (llval, llextra) = self.pointer_parts();
-        PlaceValue { llval, llextra, align }
+        PlaceValue { llval, llextra, align, raw_deref: false }
     }
 
     #[must_use]
@@ -314,7 +314,12 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
             .unwrap_or_else(|| bug!("deref of non-pointer {:?}", self));
 
         let layout = cx.layout_of(projected_ty);
-        self.val.deref(layout.align.abi).with_type(layout)
+        let val = self.val.deref(layout.align.abi);
+        // Only raw pointers escape the static guarantees that let `-Zfil-c` skip a
+        // runtime check: a `&T`/`&mut T` has already been proven to point at live,
+        // in-bounds memory by the borrow checker.
+        let val = if self.layout.ty.is_raw_ptr() { val.with_raw_deref() } else { val };
+        val.with_type(layout)
     }
 
     /// Store this operand into a place, applying move/copy annotation if present.
@@ -1027,6 +1032,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandValue<V> {
         flags: MemFlags,
     ) {
         debug!("OperandRef::store: operand={:?}, dest={:?}", self, dest);
+        let flags = if dest.val.raw_deref { flags } else { flags | MemFlags::FILC_SAFE };
         match self {
             OperandValue::ZeroSized => {
                 // Avoid generating stores of zero-sized values, because the only way to have a

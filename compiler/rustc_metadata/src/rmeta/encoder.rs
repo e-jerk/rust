@@ -746,6 +746,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 proc_macro_data,
                 debugger_visualizers,
                 compiler_builtins: find_attr!(attrs, CompilerBuiltins),
+                filc_runtime: find_attr!(attrs, FilcRuntime),
                 needs_allocator: find_attr!(attrs, NeedsAllocator),
                 needs_panic_runtime: find_attr!(attrs, NeedsPanicRuntime),
                 no_builtins: find_attr!(attrs, NoBuiltins),

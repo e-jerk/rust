@@ -85,6 +85,11 @@ pub struct ModuleConfig {
     pub sanitizer_recover: SanitizerSet,
     pub sanitizer_dataflow_abilist: Vec<String>,
     pub sanitizer_memory_track_origins: usize,
+    /// Enable Fil-C memory safety instrumentation.
+    pub fil_c: bool,
+    /// Instrument every memory access, rather than only the ones that Rust's
+    /// compile-time checks cannot already prove safe.
+    pub filc_instrument_all: bool,
 
     // Flags indicating which outputs to produce.
     pub emit_pre_lto_bc: bool,
@@ -193,6 +198,11 @@ impl ModuleConfig {
             sanitizer_memory_track_origins: if_regular!(
                 sess.opts.unstable_opts.sanitizer_memory_track_origins,
                 0
+            ),
+            fil_c: if_regular!(sess.opts.unstable_opts.fil_c, false),
+            filc_instrument_all: if_regular!(
+                sess.opts.unstable_opts.filc_instrument_all,
+                false
             ),
 
             emit_pre_lto_bc: if_regular!(

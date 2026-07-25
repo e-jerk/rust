@@ -642,6 +642,8 @@ pub(crate) unsafe fn llvm_optimize(
             sanitize_kernel_hwaddress_recover: config
                 .sanitizer_recover
                 .contains(SanitizerSet::KERNELHWADDRESS),
+            fil_c: config.fil_c,
+            filc_instrument_all: config.filc_instrument_all,
         })
     } else {
         None

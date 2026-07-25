@@ -266,6 +266,8 @@ declare_features! (
     (internal, eii_internals, "1.94.0", None),
     /// Implementation details of field representing types.
     (internal, field_representing_type_raw, "1.96.0", None),
+    /// Used to identify crates that contain the Fil-C runtime.
+    (internal, filc_runtime, "1.99.0", None),
     /// Outputs useful `assert!` messages
     (unstable, generic_assert, "1.63.0", None),
     /// Allows using the #[rustc_intrinsic] attribute.

@@ -1107,6 +1107,9 @@ pub enum AttributeKind {
     /// Represents `#[ffi_pure]`.
     FfiPure(Span),
 
+    /// Represents `#[filc_runtime]`
+    FilcRuntime,
+
     /// Represents `#[fundamental]`.
     Fundamental,
 

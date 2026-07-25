@@ -1,4 +1,5 @@
 #include "LLVMWrapper.h"
+#include "FilCPass.h"
 
 #include "llvm-c/Core.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -598,6 +599,8 @@ struct LLVMRustSanitizerOptions {
   bool SanitizeKernelAddressRecover;
   bool SanitizeKernelHWAddress;
   bool SanitizeKernelHWAddressRecover;
+  bool FilC;
+  bool FilCInstrumentAll;
 };
 
 extern "C" typedef void (*registerEnzymeAndPassPipelineFn)(
@@ -844,6 +847,14 @@ extern "C" LLVMRustResult LLVMRustOptimize(
                                             OptimizationLevel Level,
                                             ThinOrFullLTOPhase phase) {
         MPM.addPass(RealtimeSanitizerPass());
+      });
+    }
+    if (SanitizerOptions->FilC) {
+      bool InstrumentAll = SanitizerOptions->FilCInstrumentAll;
+      OptimizerLastEPCallbacks.push_back([InstrumentAll](ModulePassManager &MPM,
+                                                        OptimizationLevel Level,
+                                                        ThinOrFullLTOPhase phase) {
+        MPM.addPass(FilCPass(InstrumentAll));
       });
     }
   }

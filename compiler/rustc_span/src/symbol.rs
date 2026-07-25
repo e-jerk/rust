@@ -971,6 +971,7 @@ symbols! {
         field_type,
         fields,
         file,
+        filc_runtime,
         final_associated_functions,
         float_to_int_unchecked,
         floorf16,

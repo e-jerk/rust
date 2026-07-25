@@ -51,6 +51,7 @@ impl<'sess> AttributeParser<'sess> {
             sym::intrinsics => ("the `rustc_intrinsic` attribute is used to declare intrinsics as function items".to_string(), &[]),
             sym::lang_items => ("lang items are subject to change".to_string(), &[]),
             sym::prelude_import => ("the `prelude_import` attribute is for use by rustc only".to_string(), &[]),
+            sym::filc_runtime => ("the `filc_runtime` attribute is used to identify the `filc_rt` crate which contains the Fil-C runtime and will never be stable".to_string(), &[]),
             sym::profiler_runtime => ("the `profiler_runtime` attribute is used to identify the `profiler_builtins` crate which contains the profiler runtime and will never be stable".to_string(), &[]),
             sym::thread_local => ("the `thread_local` attribute is an experimental feature, and does not currently handle destructors".to_string(), &[]),
             _ => (format!("the `{attr_path}` attribute is an experimental feature"), &[]),

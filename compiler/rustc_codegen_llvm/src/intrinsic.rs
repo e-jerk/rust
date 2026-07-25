@@ -264,8 +264,15 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                         assert!(false_val.llextra.is_none());
                         assert_eq!(true_val.align, false_val.align);
                         let ptr = select(self, true_val.llval, false_val.llval);
-                        let selected =
-                            OperandValue::Ref(PlaceValue::new_sized(ptr, true_val.align));
+                        let selected = OperandValue::Ref(PlaceValue {
+                            llval: ptr,
+                            llextra: None,
+                            align: true_val.align,
+                            // Either input may have come from a raw pointer, and we
+                            // can't tell which one this is, so take the conservative
+                            // answer of the two.
+                            raw_deref: true_val.raw_deref || false_val.raw_deref,
+                        });
                         let result = PlaceRef {
                             val: result_place.unwrap(),
                             layout: result_layout,

@@ -788,8 +788,9 @@ impl MetadataBlob {
                     )?;
                     writeln!(
                         out,
-                        "compiler_builtins {} needs_allocator {} needs_panic_runtime {} no_builtins {} panic_runtime {} profiler_runtime {}",
+                        "compiler_builtins {} filc_runtime {} needs_allocator {} needs_panic_runtime {} no_builtins {} panic_runtime {} profiler_runtime {}",
                         root.compiler_builtins,
+                        root.filc_runtime,
                         root.needs_allocator,
                         root.needs_panic_runtime,
                         root.no_builtins,
@@ -2037,6 +2038,10 @@ impl CrateMetadata {
 
     pub(crate) fn is_panic_runtime(&self) -> bool {
         self.root.panic_runtime
+    }
+
+    pub(crate) fn is_filc_runtime(&self) -> bool {
+        self.root.filc_runtime
     }
 
     pub(crate) fn is_profiler_runtime(&self) -> bool {

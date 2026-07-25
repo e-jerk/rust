@@ -260,6 +260,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::Feature(..) => (),
             AttributeKind::FfiConst => (),
             AttributeKind::FfiPure(..) => (),
+            AttributeKind::FilcRuntime => (),
             AttributeKind::Fundamental => (),
             AttributeKind::Ignore { .. } => (),
             AttributeKind::InstructionSet(..) => (),

@@ -1058,6 +1058,30 @@ impl CStore {
         }
     }
 
+    fn inject_filc_runtime(&mut self, tcx: TyCtxt<'_>) {
+        if !tcx.sess.opts.unstable_opts.fil_c {
+            return;
+        }
+
+        info!("loading Fil-C runtime");
+
+        let name = Symbol::intern(&tcx.sess.opts.unstable_opts.filc_runtime);
+        let Some(cnum) = self.resolve_crate(
+            tcx,
+            name,
+            DUMMY_SP,
+            CrateDepKind::Conditional,
+            CrateOrigin::Injected,
+        ) else {
+            return;
+        };
+        let cdata = self.get_crate_data(cnum);
+
+        if !cdata.is_filc_runtime() {
+            tcx.dcx().emit_err(diagnostics::NotFilcRuntime { crate_name: name });
+        }
+    }
+
     fn inject_allocator_crate(&mut self, tcx: TyCtxt<'_>, krate: &ast::Crate) {
         self.has_global_allocator =
             match &*fn_spans(krate, Symbol::intern(&global_fn_name(sym::alloc))) {
@@ -1290,6 +1314,7 @@ impl CStore {
         self.inject_compiler_builtins(tcx, krate);
         self.inject_forced_externs(tcx);
         self.inject_profiler_runtime(tcx);
+        self.inject_filc_runtime(tcx);
         self.inject_allocator_crate(tcx, krate);
         self.inject_panic_runtime(tcx, krate);
 

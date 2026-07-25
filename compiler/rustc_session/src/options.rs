@@ -2492,6 +2492,13 @@ options! {
     fewer_names: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "reduce memory use by retaining fewer names within compilation artifacts (LLVM-IR) \
         (default: no)"),
+    fil_c: bool = (false, parse_bool, [TRACKED],
+        "enable Fil-C memory safety instrumentation and link the Fil-C runtime (default: no)"),
+    filc_instrument_all: bool = (false, parse_bool, [TRACKED],
+        "instrument every memory access under `-Zfil-c`, instead of only the accesses that \
+        Rust cannot already prove safe at compile time (default: no)"),
+    filc_runtime: String = (String::from("filc_rt"), parse_string, [TRACKED],
+        "name of the Fil-C runtime crate to automatically inject (default: `filc_rt`)"),
     fixed_x18: bool = (false, parse_bool, [TRACKED] { TARGET_MODIFIER: FixedX18 },
         "make the x18 register reserved on AArch64 (default: no)"),
     flatten_format_args: bool = (true, parse_bool, [TRACKED],

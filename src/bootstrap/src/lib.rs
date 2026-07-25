@@ -843,6 +843,9 @@ impl Build {
             features.insert("profiler");
         }
 
+        // Always include the Fil-C runtime in the sysroot so `-Z fil-c` can inject it.
+        features.insert("filc");
+
         // If zkvm target, generate memcpy, etc.
         if target.contains("zkvm") {
             features.insert("compiler-builtins-mem");

@@ -224,6 +224,15 @@ impl NoArgsAttributeParser for NeedsPanicRuntimeParser {
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::NeedsPanicRuntime;
 }
 
+pub(crate) struct FilcRuntimeParser;
+
+impl NoArgsAttributeParser for FilcRuntimeParser {
+    const PATH: &[Symbol] = &[sym::filc_runtime];
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[Allow(Target::Crate)]);
+    const STABILITY: AttributeStability = unstable!(filc_runtime);
+    const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::FilcRuntime;
+}
+
 pub(crate) struct ProfilerRuntimeParser;
 
 impl NoArgsAttributeParser for ProfilerRuntimeParser {

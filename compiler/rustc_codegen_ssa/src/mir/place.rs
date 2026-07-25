@@ -32,6 +32,14 @@ pub struct PlaceValue<V> {
 
     /// The alignment we know for this place.
     pub align: Align,
+
+    /// Whether this place was reached by dereferencing a raw pointer.
+    ///
+    /// Accesses to such a place are not covered by the borrow checker, so
+    /// `-Zfil-c` has to check them at runtime. Accesses to places where this is
+    /// `false` are already guaranteed to be in bounds and to point at live
+    /// memory, so Fil-C leaves them alone.
+    pub raw_deref: bool,
 }
 
 impl<V: CodegenObject> PlaceValue<V> {
@@ -39,7 +47,13 @@ impl<V: CodegenObject> PlaceValue<V> {
     ///
     /// Sets `llextra` to `None`.
     pub fn new_sized(llval: V, align: Align) -> PlaceValue<V> {
-        PlaceValue { llval, llextra: None, align }
+        PlaceValue { llval, llextra: None, align, raw_deref: false }
+    }
+
+    /// Marks this place as reached through a raw pointer, so that `-Zfil-c`
+    /// checks accesses to it (and to anything projected out of it) at runtime.
+    pub fn with_raw_deref(self) -> PlaceValue<V> {
+        PlaceValue { raw_deref: true, ..self }
     }
 
     /// Allocates a stack slot in the function for a value
@@ -192,6 +206,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
                     None
                 },
                 align: effective_field_align,
+                raw_deref: self.val.raw_deref,
             };
             val.with_type(field)
         };
@@ -246,8 +261,12 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
 
         // Adjust pointer.
         let ptr = bx.inbounds_ptradd(self.val.llval, offset);
-        let val =
-            PlaceValue { llval: ptr, llextra: self.val.llextra, align: effective_field_align };
+        let val = PlaceValue {
+            llval: ptr,
+            llextra: self.val.llextra,
+            align: effective_field_align,
+            raw_deref: self.val.raw_deref,
+        };
         val.with_type(field)
     }
 
@@ -288,7 +307,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
 
         let llval = bx.inbounds_nuw_gep(bx.cx().backend_type(layout), self.val.llval, &[llindex]);
         let align = self.val.align.restrict_for_offset(offset);
-        PlaceValue::new_sized(llval, align).with_type(layout)
+        PlaceValue { llval, llextra: None, align, raw_deref: self.val.raw_deref }.with_type(layout)
     }
 
     pub fn project_downcast<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
